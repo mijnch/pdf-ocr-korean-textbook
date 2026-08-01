@@ -1,0 +1,21 @@
+# 재다운로드 가능한 것 — 저장소에 넣지 않는다
+scripts/tessdata/
+__pycache__/
+*.pyc
+*.pyo
+
+# 입력/출력 폴더 (작업물은 Documents 쪽이 원본)
+PDF OCR/*입력*/
+PDF OCR/*출력*/
+*.pdf
+*.png
+*.jpg
+
+# 백업 사본
+*.bak
+*.bak_*
+*_백업/
+
+# 실제 사용 프로파일·개인 설명서는 공개하지 않는다 (예시는 장구분.example.toml)
+장구분.toml
+사용 설명서.txt
