@@ -512,11 +512,19 @@ check("parse book chapters", _prof["책A"] == {5: "제1장 가", 2: "제2장 나
 check("parse force_scan", _fscan == {"책B"} and _prof["책B"] == {1: "장"})
 check("parse skip bad entries", "책C" not in _prof)   # 유효 항목이 하나도 없음
 check("parse skip noname", all(n for n in _prof))
-# 실데이터는 구조만 확인 — 개수는 사용자가 편집해도 되도록 못 박지 않는다
-_ch = pdf_chapters.for_book("대학물리 교재")
-check("chapters loaded", len(_ch) >= 1
-      and all(isinstance(p, int) and p >= 1 and t.strip() for p, t in _ch.items()))
-check("chapters force_scan flag", pdf_chapters.force_scan("전기회로이론") is True)
+# 실데이터는 구조만 확인 — 개수는 사용자가 편집해도 되도록 못 박지 않는다.
+# 장구분.toml 은 개인 프로파일이라 저장소에 없다(장구분.example.toml 만 배포).
+# 그러니 새로 설치한 PC에서는 이 두 건을 건너뛴다 — 없다고 실패로 세면
+# 설치하자마자 "도구가 깨졌다"는 잘못된 인상을 준다. 파일 없이도 도구는
+# 정상 동작한다(pdf_chapters 가 장 헤딩만 빼고 진행한다).
+if pdf_chapters.PROFILE_PATH.is_file():
+    _ch = pdf_chapters.for_book("대학물리 교재")
+    check("chapters loaded", len(_ch) >= 1
+          and all(isinstance(p, int) and p >= 1 and t.strip() for p, t in _ch.items()))
+    check("chapters force_scan flag", pdf_chapters.force_scan("전기회로이론") is True)
+else:
+    print(f"  [건너뜀] 장구분.toml 이 없어 실데이터 2건을 건너뜁니다 "
+          f"({pdf_chapters.PROFILE_PATH.name} 은 개인 설정이라 배포되지 않습니다)")
 check("chapters unknown book", pdf_chapters.for_book("없는책") == {})
 check("chapters toc", pdf_chapters.toc_block({11: "제1장 가", 37: "제2장 나"})
       == ["## 장 구분(자동 감지)", "", "- 제1장 가 — 11페이지", "- 제2장 나 — 37페이지", ""])
