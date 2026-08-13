@@ -25,7 +25,14 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 # 정규화 일치 90.8% (차이는 \biggl<->\left 등 렌더 동등 변형).
 # 폴백 모델(fp32 원본·int8dec)은 컴팩트화로 삭제됨 — 폴더가 파손되면
 # 동봉된 mfr_transplant.py / mfr_export.py로 재제작하거나 재다운로드한다.
-_P2T = Path(os.environ.get("APPDATA", "")) / "pix2text" / "1.1"
+# ★ common 을 여기서 import 하는 이유: common 이 PIX2TEXT_HOME 을 설정하는데,
+# 그 값은 pix2text 가 import 되기 전에 정해져 있어야 한다(pix2text 는 import
+# 시점에 data_dir()을 굳힌다). pix2text import 는 load_models() 안에서 지연
+# 실행되지만, 순서를 코드 구조에 의존시키지 않으려고 모듈 최상단에서 못 박는다.
+# common 은 프로젝트 모듈을 하나도 import 하지 않으므로 순환 위험이 없다.
+import common  # noqa: E402
+
+_P2T = common.P2T_MODEL_DIR
 MFR_KV_DIR = _P2T / "mfr-1.5-onnx-kvint8"
 
 # 수식 감지 입력 크기. 전공책처럼 글자가 작고 빽빽한 페이지를 위해 1024 사용.
@@ -130,8 +137,8 @@ def load_models():
         # '완전 오프라인' 보증을 지키기 위해 먼저 확인하고 명확히 알린다.
         # 폴더가 아니라 파일 이름까지 확인한다 — 부분 손상이면 폴더는 있는데
         # 라이브러리가 외부로 나가려 든다(검토단이 실제 호출을 관측).
-        if not os.environ.get("APPDATA"):
-            raise RuntimeError("APPDATA 환경변수가 없어 모델 경로를 찾을 수 없습니다.")
+        # (APPDATA 존재 확인은 없앴다 — 모델 경로가 더 이상 APPDATA 에 의존하지
+        #  않고 이 폴더 안(common.P2T_MODEL_DIR)을 가리키기 때문이다.)
         mfd_onnx = _P2T / "mfd-1.5-onnx" / "pix2text-mfd-1.5.onnx"
         if not mfd_onnx.is_file():
             raise RuntimeError(

@@ -13,8 +13,13 @@ import onnx
 from onnx.numpy_helper import to_array
 import torch
 
-SRC = (Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-       / "pix2text" / "1.1" / "mfr-1.5-onnx")
+# 모델은 도구 폴더 안에 있다(common.P2T_MODEL_DIR 와 같은 위치). 예전에는
+# %APPDATA%\pix2text 를 봤으나, 도구가 자기 폴더 밖을 건드리지 않도록 옮겼다.
+# 여기서는 common 을 import 하지 않고 __file__ 기준으로 직접 계산한다 —
+# 이 스크립트는 sys.path 설정 없이 단독 실행되는 일회성 유틸리티다.
+# (원본 fp32 mfr-1.5-onnx 는 컴팩트화로 삭제됐으므로 재제작 시 재다운로드가 필요하다.)
+SRC = (Path(__file__).resolve().parent.parent
+       / "models" / "pix2text" / "1.1" / "mfr-1.5-onnx")
 SCRATCH = Path(__file__).resolve().parent
 PT_DIR = SCRATCH / "mfr_pt"
 KV_DIR = SCRATCH / "mfr_kv_onnx"

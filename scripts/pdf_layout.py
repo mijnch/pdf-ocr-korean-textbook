@@ -17,6 +17,11 @@ from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+# ★ common 이 PIX2TEXT_HOME 을 설정한다 — pix2text 가 import 되기 전에 정해져
+# 있어야 하므로 모듈 최상단에서 못 박는다. common 은 프로젝트 모듈을 하나도
+# import 하지 않아 순환 위험이 없다.
+import common  # noqa: E402
+
 # 레이아웃 추론 입력 크기. 재측정(5권 13쪽, 검토단 4 지적 반영): 896과 1024의 영역
 # 회수는 사실상 동일하고(text 147=147, image 33/31, formula 30/31 — 차이는 양방향
 # 노이즈 수준), 오히려 표 밀집 페이지(응용수학 p841)에서는 1024가 그림을 덜 찾았다.
@@ -57,8 +62,7 @@ def load_parser():
         # '완전 오프라인' 보증을 지키기 위해 여기서 확인하고 명확히 알린다.
         # 폴더 존재만 보면 부분 손상(중단된 복원·동기화 미완)을 놓쳐 실제로
         # 외부 접속을 시도한다 — 필요한 파일 이름까지 확인한다(검토단 관측).
-        model_dir = (Path(os.environ.get("APPDATA", "")) / "pix2text" / "1.1"
-                     / "layout-docyolo")
+        model_dir = common.P2T_MODEL_DIR / "layout-docyolo"
         weight = model_dir / "doclayout_yolo_docstructbench_imgsz1024.pt"
         if not weight.is_file():
             raise RuntimeError(

@@ -1,5 +1,14 @@
 # 재다운로드 가능한 것 — 저장소에 넣지 않는다
+# (tessdata·models 는 릴리스 자산으로 배포한다. scripts/setup_env.py 가 받아온다)
 scripts/tessdata/
+scripts/models/
+
+# 폴더 안 파이썬 환경 (1.4GB). setup_env.py 가 대상 PC에서 새로 만든다.
+venv/
+_assets.zip
+
+# 변환 중 쓰는 작업 폴더 (도구 폴더 안에 두어 %TEMP% 를 더럽히지 않는다)
+.tmp/
 __pycache__/
 *.pyc
 *.pyo

@@ -18,6 +18,35 @@ TESSERACT_DIR = Path(r"C:\Program Files\Tesseract-OCR")
 # 고정밀(tessdata_best) 한국어+영어 모델
 TESSDATA_DIR = Path(__file__).resolve().parent / "tessdata" / "best"
 
+# pix2text 모델(레이아웃·수식 검출/인식, 약 215MB)도 이 폴더 안에 둔다.
+# 라이브러리 기본값은 %APPDATA%\pix2text 라, 그대로 두면 도구가 자기 폴더 밖에
+# 215MB를 남기고 폴더만 복사해서는 동작하지 않는다. pix2text 는 PIX2TEXT_HOME
+# 을 존중하므로(pix2text/utils.py: os.getenv('PIX2TEXT_HOME', ...)) 그것으로
+# 폴더 안을 가리킨다 — 라이브러리가 공식 지원하는 경로이지 우회가 아니다.
+# ★ pix2text 가 import 되기 전에 설정돼야 하므로 모듈 최상단에 둔다.
+P2T_HOME = Path(__file__).resolve().parent / "models" / "pix2text"
+P2T_MODEL_DIR = P2T_HOME / "1.1"
+os.environ["PIX2TEXT_HOME"] = str(P2T_HOME)
+
+# 작업용 임시 폴더도 이 폴더 안에 둔다 — 기본값(%TEMP%)을 쓰면 변환 중 수백 MB의
+# 페이지 이미지가 폴더 밖에 생긴다. 정상 종료 시에는 자동 정리되지만, 중단·강제
+# 종료가 나면 %TEMP% 에 잔재가 남는다. 여기 두면 흔적이 폴더 안에서만 생긴다.
+# 실제 사용은 tempfile.TemporaryDirectory(dir=TMP_ROOT) 형태다.
+TMP_ROOT = BASE_DIR / ".tmp"
+
+
+def tmp_root() -> Path:
+    """임시 폴더의 부모를 돌려준다(없으면 만든다).
+
+    쓰기가 막힌 위치에 도구가 놓였을 때까지 실패시키지는 않는다 —
+    그 경우에만 시스템 기본 임시 폴더로 물러선다(None 반환 시 tempfile 기본).
+    """
+    try:
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        return TMP_ROOT
+    except OSError:
+        return None
+
 # ultralytics의 자동 pip 설치를 차단한다 — onnxruntime-directml(iGPU 가속)을 배포명이
 # 다르다는 이유로 "onnxruntime 없음"으로 오판해 CPU판을 재설치하며 DirectML 런타임
 # DLL을 덮어써 버린다(검토단이 실제로 유발). 이 가드는 setup_external_tools()가

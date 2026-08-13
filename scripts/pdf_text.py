@@ -413,6 +413,12 @@ def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
     다단(bands)이 주어지면 칼럼별로 잘라 따로 인식한다 — 스캔 페이지에서 Tesseract가
     칼럼을 가로질러 읽어 좌·우단이 한 줄에 섞이는 것을 방지한다.
     좌표(mask_boxes/bands/반환 줄 상자)는 모두 page_image의 픽셀 공간이다.
+
+    ★ tag는 호출자마다 반드시 달라야 한다 — tmp_dir는 책 한 권 전체가 공유하므로,
+    tag가 겹치면 서로 다른 쪽이 같은 임시 PNG(`band{tag}{i}.png`)에 겹쳐 쓴다.
+    그러면 A쪽 OCR이 B쪽 이미지를 읽어 **조용히 틀린 본문**이 나온다(예외도 안 난다).
+    현재 호출부는 `p{page_no}` / `p{page_no}r`을 넘긴다. 쪽 간 파이프라이닝을
+    도입하더라도 이 규칙만 지키면 임시 파일 충돌은 발생하지 않는다.
     """
     from PIL import ImageDraw
 

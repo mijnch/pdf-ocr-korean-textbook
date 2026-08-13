@@ -12,13 +12,17 @@ PermissionError 로 끝난다.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tomllib
 from datetime import date
 from pathlib import Path
 
-DOCS = Path.home() / "Documents"
+# 산출물이 있는 위치이자 안내 문서를 쓸 위치. 도구가 자기 폴더 밖을 스스로
+# 정하지 않도록 PDF_EDITOR_CORPUS 로 덮어쓸 수 있게 한다 — 지정하면 그곳에만 쓴다.
+# (기본값은 종전과 같아 기존 사용법이 그대로 동작한다.)
+DOCS = Path(os.environ.get("PDF_EDITOR_CORPUS") or (Path.home() / "Documents"))
 PROFILE = Path(__file__).resolve().parent.parent / "장구분.toml"
 
 def find_books() -> list[tuple[str, str]]:

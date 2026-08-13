@@ -14,13 +14,16 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tomllib
 from pathlib import Path
 
 PROFILE = Path(__file__).resolve().parent.parent / "장구분.toml"
-DOCS = Path.home() / "Documents"
+# 산출물이 있는 위치. PDF_EDITOR_CORPUS 로 덮어쓸 수 있다(기본값은 종전과 동일).
+# 이 스크립트는 읽기 전용이라 아무것도 고치지 않는다.
+DOCS = Path(os.environ.get("PDF_EDITOR_CORPUS") or (Path.home() / "Documents"))
 
 def book_dirs() -> dict[str, str]:
     """PDF stem -> 산출물이 있는 과목 폴더. 산출물에서 찾아낸다.

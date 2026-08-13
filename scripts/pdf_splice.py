@@ -25,7 +25,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from common import exit_with_message, setup_external_tools
+from common import exit_with_message, setup_external_tools, tmp_root
 from pdf_ocr import (
     HIRES_MAX_DPI,
     RENDER_DPI,
@@ -93,7 +93,7 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
     try:
         if max(pages) > len(pdf):
             exit_with_message(f"원본 PDF는 {len(pdf)}페이지입니다: {max(pages)}페이지 없음")
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=tmp_root()) as tmp:
             tmp_dir = Path(tmp)
             for pno in pages:
                 page = pdf[pno - 1]

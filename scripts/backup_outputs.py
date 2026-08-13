@@ -15,12 +15,16 @@ PNG는 이미 압축된 형식이라 다시 압축해도 줄지 않는다 — �
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import zipfile
 from pathlib import Path
 
-DOCS = Path.home() / "Documents"
+# 산출물이 있는 위치. 도구가 자기 폴더 밖을 스스로 정하지 않도록 환경변수로
+# 덮어쓸 수 있게 한다 — PDF_EDITOR_CORPUS 를 지정하면 그곳만 건드린다.
+# (기본값은 종전과 같아 기존 사용법이 그대로 동작한다.)
+DOCS = Path(os.environ.get("PDF_EDITOR_CORPUS") or (Path.home() / "Documents"))
 BACKUP_DIR = DOCS / "PDF_Editor_백업"
 DEFAULT_BOOKS = ["대학수학", "전자기학", "응용수학", "대학물리", "전기회로이론"]
 
