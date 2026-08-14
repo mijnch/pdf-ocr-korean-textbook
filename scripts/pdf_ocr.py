@@ -1948,18 +1948,33 @@ def main() -> None:
             " 있거나, 폴더에 쓸 권한이 없거나, 디스크가 가득 찼을 수 있습니다.\n"
             f"  {e}")
 
-    pdfs = find_pdfs(input_dir)
-    if not pdfs:
-        exit_with_message(
-            f"입력 폴더에 PDF 파일이 없습니다.\nOCR을 적용할 PDF를 여기에 넣어 주세요:\n  {input_dir}"
-        )
+    # 바로가기에 PDF를 끌어다 놓으면 그 파일들을 바로 처리한다 — 입력 폴더를
+    # 찾아 들어가 복사하는 단계가 없어진다. 원본은 읽기만 하므로 그대로 남는다.
+    dropped = [Path(a) for a in sys.argv[1:]]
+    if dropped:
+        pdfs = [p for p in dropped if p.suffix.lower() == ".pdf" and p.is_file()]
+        for p in dropped:
+            if p not in pdfs:
+                why = "PDF가 아닙니다" if p.suffix.lower() != ".pdf" else "파일을 찾을 수 없습니다"
+                print(f"[건너뜀] {p.name} — {why}")
+        if not pdfs:
+            exit_with_message("처리할 PDF가 없습니다. PDF 파일을 끌어다 놓아 주세요.")
+        print(f"[끌어다 놓기] {len(pdfs)}개 파일을 바로 처리합니다.\n")
+    else:
+        pdfs = find_pdfs(input_dir)
+        if not pdfs:
+            exit_with_message(
+                f"입력 폴더에 PDF 파일이 없습니다.\n"
+                f"OCR을 적용할 PDF를 여기에 넣어 주세요:\n  {input_dir}\n"
+                f"\n또는 바탕화면 'PDF OCR' 바로가기에 PDF를 끌어다 놓으면 바로 변환됩니다."
+            )
 
-    # 하위 폴더는 탐색하지 않는다 — 챕터별 폴더를 통째로 끌어다 놓는 실수가
-    # 흔하므로 조용히 넘기지 않고 알린다(검토단 지적).
-    skipped = find_skipped_subfolders(input_dir)
-    if skipped:
-        print(f"[알림] PDF가 든 하위 폴더 {len(skipped)}개는 처리하지 않습니다"
-              f" ({', '.join(skipped[:5])}). PDF를 입력 폴더에 직접 놓아 주세요.\n")
+        # 하위 폴더는 탐색하지 않는다 — 챕터별 폴더를 통째로 끌어다 놓는 실수가
+        # 흔하므로 조용히 넘기지 않고 알린다(검토단 지적).
+        skipped = find_skipped_subfolders(input_dir)
+        if skipped:
+            print(f"[알림] PDF가 든 하위 폴더 {len(skipped)}개는 처리하지 않습니다"
+                  f" ({', '.join(skipped[:5])}). PDF를 입력 폴더에 직접 놓아 주세요.\n")
 
     # 이전 실행이 중단된 잔해가 정식 이름을 차지하고 있으면 다음 완성본이
     # '(1)'로 밀려나 사람도 AI도 잘린 파일을 먼저 연다(검토단 실증).
@@ -2002,6 +2017,15 @@ def main() -> None:
         os._exit(130)
 
     print(f"=== 완료: Markdown {ok}개 저장 → {output_dir} ===")
+
+    # 결과를 보러 폴더를 찾아 들어가지 않아도 되도록 열어 준다.
+    # 실패해도 변환 자체는 끝났으므로 조용히 넘긴다(원격·무인 실행 대비).
+    if ok:
+        try:
+            os.startfile(output_dir)
+        except Exception:
+            pass
+
     if failures:
         print(f"처리하지 못한 파일 {len(failures)}개: {', '.join(failures)}")
         sys.exit(1)
