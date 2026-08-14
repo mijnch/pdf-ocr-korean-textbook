@@ -78,6 +78,8 @@ from common import (
     exit_with_message,
     feature_dirs,
     find_pdfs,
+    find_skipped_subfolders,
+    find_stale_outputs,
     human_size,
     setup_external_tools,
     tmp_root,
