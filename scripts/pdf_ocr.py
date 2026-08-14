@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1996,6 +1997,7 @@ def main() -> None:
     except Exception as e:  # 모델 파손 등 RuntimeError 외 오류도 안내로 전환
         exit_with_message(str(e))
 
+    started = time.monotonic()
     ok = 0
     failures: list[str] = []
     try:
@@ -2023,6 +2025,15 @@ def main() -> None:
     if ok:
         try:
             os.startfile(output_dir)
+        except Exception:
+            pass
+
+    # 오래 걸린 작업은 자리를 비우게 된다 — 끝났음을 소리로 알린다.
+    # 짧은 변환까지 울리면 성가시므로 1분을 넘긴 경우만.
+    if time.monotonic() - started > 60:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
 
