@@ -1327,19 +1327,25 @@ TEXTBOX_MIN_HANGUL = 40     # 한글 산문으로 인정할 최소 글자수
 TEXTBOX_MIN_WORDS = 15      # 영문 산문으로 인정할 최소 낱말수(3글자 이상)
 TEXTBOX_LINE_LETTERS = 6    # 상자 안에서 '문장 줄'로 칠 최소 실질 글자수
 TEXTBOX_MIN_TINT = 0.15     # 바탕이 이만큼 칠해져 있어야 글상자 후보
+TEXTBOX_TABLE_MIN_TINT = 0.08  # 표로 잡힌 영역의 완화된 바탕 문턱(판정은 더 엄격)
 TEXTBOX_MAX_PER_PAGE = 2    # 한 쪽에서 다시 읽어 볼 상자 수 상한
 
 
-def looks_like_prose(text: str) -> bool:
+def looks_like_prose(text: str, strict: bool = False) -> bool:
     """크롭 OCR 결과가 '도표 라벨'이 아니라 '문장'인지 판정한다.
 
     색 배경 예제·정리 상자는 레이아웃 모델이 통째로 그림으로 잡는다. 상자를
     한 번 더 읽어 이 판정을 통과하면 글상자이므로 본문으로 되살린다. 도표는
     라벨이 짧고 흩어져 있어 통과하지 못한다 — 실측: 회로도 한 장의 실질
     글자는 약 25자('Vcc Vb Q3 Q4 Vout Vin1 Vin2 IEE'), 한글은 0자다.
+
+    strict면 한글 산문만 인정한다. 표로 잡힌 영역에 쓴다 — 영문 낱말 기준을
+    허용하면 진짜 표가 통과한다(실측: 발진기 비교표 한 장이 영단어 60개,
+    한글 0자). 같은 책의 예제 상자는 한글 122~539자였다.
     """
-    return (len(_PROSE_HANGUL.findall(text)) >= TEXTBOX_MIN_HANGUL
-            or len(_PROSE_WORD.findall(text)) >= TEXTBOX_MIN_WORDS)
+    if len(_PROSE_HANGUL.findall(text)) >= TEXTBOX_MIN_HANGUL:
+        return True
+    return not strict and len(_PROSE_WORD.findall(text)) >= TEXTBOX_MIN_WORDS
 
 
 _PAGE_NO_TOKEN = re.compile(r"(?<![\d.])(\d{1,4})(?![\d.])")
@@ -1578,13 +1584,24 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
         # 바탕이 옅게 칠해진 영역만, 그것도 큰 것 두 개까지. 글상자는 바탕색으로
         # 본문과 구분되게 조판돼 있고, 흰 바탕의 도표는 이 문턱을 넘지 못한다
         # (실측: 예제 상자 59~60%, 흰 바탕 도표 0~5%).
-        _cands = [r for r in image_regions
-                  if r.get("type") != "TABLE"
-                  and (r["x1"] - r["x0"]) * (r["y1"] - r["y0"])
-                  >= TEXTBOX_MIN_AREA * _page_area
-                  and tinted_ratio(page_image, r) > TEXTBOX_MIN_TINT]
-        _cands.sort(key=lambda r: -(r["x1"] - r["x0"]) * (r["y1"] - r["y0"]))
-        for _i, r in enumerate(_cands[:TEXTBOX_MAX_PER_PAGE]):
+        # 표로 잡힌 영역도 후보에 넣되(예제 상자의 절반 이상이 TABLE로 분류된다 —
+        # 테두리와 가로줄이 표처럼 보이기 때문이다), 문턱을 다르게 건다: 상자의
+        # 색 띠는 머리 부분뿐이라 전체 유색 비율이 낮게 나오므로 바탕 조건은
+        # 낮추고, 대신 한글 산문만 인정한다(looks_like_prose strict). 여기서
+        # 되살리는 것은 흐르는 글이지 표가 아니다 — '틀린 표는 표가 없는 것보다
+        # 나쁘다'는 원칙은 격자를 가진 Markdown 표를 지어내지 않는다는 뜻이고,
+        # 표 자체는 지금도 PNG로 그대로 남는다.
+        _cands = []
+        for r in image_regions:
+            if (r["x1"] - r["x0"]) * (r["y1"] - r["y0"]) < TEXTBOX_MIN_AREA * _page_area:
+                continue
+            strict = r.get("type") == "TABLE"
+            floor = TEXTBOX_TABLE_MIN_TINT if strict else TEXTBOX_MIN_TINT
+            if tinted_ratio(page_image, r) <= floor:
+                continue
+            _cands.append((r, strict))
+        _cands.sort(key=lambda rs: -(rs[0]["x1"] - rs[0]["x0"]) * (rs[0]["y1"] - rs[0]["y0"]))
+        for _i, (r, _strict) in enumerate(_cands[:TEXTBOX_MAX_PER_PAGE]):
             rec = ocr_region_lines(
                 hires_image if hires_image is not None else page_image,
                 (r["x0"] * k, r["y0"] * k, r["x1"] * k, r["y1"] * k),
@@ -1594,7 +1611,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
             keep = [ln for ln in sorted(rec, key=lambda l: (l["y0"], l["x0"]))
                     if len(_WORDISH.findall(ln["text"])) >= TEXTBOX_LINE_LETTERS]
             text = clean_text(" ".join(ln["text"] for ln in keep))
-            if not looks_like_prose(text):
+            if not looks_like_prose(text, strict=_strict):
                 continue
             textbox_recovered.append({"x0": r["x0"], "y0": r["y0"], "x1": r["x1"],
                                       "y1": r["y1"], "col": r.get("col", 1),

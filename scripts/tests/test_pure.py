@@ -317,6 +317,18 @@ check("prose circuit labels not",
       not pdf_ocr.looks_like_prose("Vcc Vb Q3 Q4 Vout Vin1 Vin2 P IEE (a) (b)"))
 check("prose graph legend not",
       not pdf_ocr.looks_like_prose("IC Forward Active Region VCE V1 IS exp"))
+# 표로 잡힌 영역은 한글 산문만 인정한다 — 영문 비교표가 통과하면 안 된다
+# (실측: 발진기 비교표 영단어 60개·한글 0자 / 같은 책 예제 상자 한글 122~539자)
+check("prose strict rejects english table", not pdf_ocr.looks_like_prose(
+    "LC Oscillators Cross-Coupled Colpitts Phase Shift Wien-Bridge Ring "
+    "Oscillator Frequency Response Amplitude Startup Condition Loop Gain "
+    "Negative Resistance Tank Circuit Quality Factor Output Swing Power",
+    strict=True))
+check("prose strict keeps korean box", pdf_ocr.looks_like_prose(
+    "예제 4.11 회로에서 소자가 능동 영역에서 동작한다는 것을 증명하고 전압을 "
+    "구하라. 풀이 전압 강하는 증가하여 컬렉터 전압은 다음과 같이 계산된다.",
+    strict=True))
+
 check("prose english box", pdf_ocr.looks_like_prose(
     "The transfer function of the network shown above may be obtained by writing "
     "a node equation at the output and solving for the resulting ratio between "
