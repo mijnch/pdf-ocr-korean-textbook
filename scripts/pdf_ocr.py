@@ -34,6 +34,7 @@ import re
 import sys
 import tempfile
 import time
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -70,6 +71,7 @@ from pdf_text import (  # noqa: F401
     make_scan_cell_fn,
     merge_rescue_lines,
     native_scan_dpi,
+    ocr_region_lines,
     ocr_region_text,
     start_tesseract,
     tesseract_lines,
@@ -482,6 +484,22 @@ def colored_ratio(page_image, region: dict) -> float:
     return colored / len(pix) if pix else 0.0
 
 
+
+
+def tinted_ratio(page_image, region: dict) -> float:
+    """영역 배경이 '밝지만 희지 않은' 픽셀의 비율 — 옅은 색 상자를 가려낸다.
+
+    colored_ratio(채도 40 초과)는 진한 색만 잡는다. 교재의 예제 상자는 아주
+    옅은 하늘색인 경우가 많아 그 문턱을 넘지 못한다(전자회로 p500 상자:
+    채도 기준 3.2%, 이 기준 59.9%). 흰 바탕의 도표는 0~5%다(실측).
+    """
+    crop = page_image.crop(
+        (region["x0"], region["y0"], region["x1"], region["y1"])
+    ).convert("RGB").resize((48, 48))
+    pix = list(crop.getdata())
+    tint = sum(1 for r, g, b in pix
+               if min(r, g, b) > 170 and max(r, g, b) - min(r, g, b) > 6)
+    return tint / len(pix) if pix else 0.0
 
 
 def is_callout(region: dict, page_image) -> bool:
@@ -1104,50 +1122,132 @@ def has_ink(page_image, thresh: int = 250, min_ratio: float = 0.002) -> bool:
 
 _PREAMBLE_LINE = re.compile(r"(?m)^> \*\*AI 안내\*\*: .*$")
 _PAGE_HEAD_NO = re.compile(r"(?m)^## (\d+)페이지 \(인쇄 (\d+)쪽\)$")
+_PAGE_HEAD_ANY = re.compile(r"(?m)^## (\d+)페이지(?: \(인쇄 (\d+)쪽\))?$")
 PAGE_NO_WINDOW = 10      # 이웃 판정 창(앞뒤 쪽 수)
 PAGE_NO_MIN_VOTES = 3    # 창 안에 이만큼 있어야 판정한다
-PAGE_NO_TOL = 3          # 이웃 중앙값과 이만큼 넘게 어긋나면 오탐
+PAGE_NO_TOL = 1          # 이웃 중앙값과 이만큼 넘게 어긋나면 오탐
+PAGE_NO_FILL_GAP = 20    # 오프셋이 같은 두 확정값 사이가 이 폭 이하면 메운다
 
 
-def prune_page_number_outliers(md_path: Path) -> int:
-    """이웃 쪽과 오프셋이 어긋나는 인쇄 쪽번호를 지운다. 반환: 지운 개수.
+def confirm_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """이웃 오프셋 중앙값과 어긋나는 (PDF쪽, 인쇄쪽)을 버린다.
 
     쪽마다 독립으로 읽으면 머리말의 다른 숫자(장 번호·연도·수식)가 쪽번호로
     둔갑한다 — 실측: 전자기학은 머리말에 쪽번호가 아예 없는데 562쪽 중 13쪽에
-    엉뚱한 값이 붙었고(예: PDF 81쪽 → '인쇄 22쪽'), 대학수학은 오프셋이
-    +5~+8이어야 하는데 -30~+10으로 흩어졌다.
+    엉뚱한 값이 붙었고(예: PDF 81쪽 → '인쇄 22쪽').
 
-    오프셋은 책 안에서 변하지만 천천히 변한다(실측 최대 변화폭 16, 1,177쪽에
-    걸쳐). 그래서 이웃 창의 중앙값에서 크게 벗어나면 오탐이다. 창 안에 표본이
-    부족하면(고립된 값) 검증할 수 없으므로 지운다 — 확인 못 한 쪽번호는
-    없는 것보다 나쁘다(AI가 그 값을 믿고 엉뚱한 쪽을 읽는다).
+    허용 오차 1: 예전 값 3은 실측에서 오탐을 그대로 통과시켰다 — 반도체 교재는
+    본문 오프셋이 25로 일정한데 오독이 22·27로 떨어져 ±3 문턱을 아슬아슬하게
+    넘겼고, PDF 200쪽이 실제 175쪽인데 '인쇄 178쪽'으로 새겨져 203쪽과 값이
+    겹쳤다. 1로 조여도 정상인 세 권은 한 개도 잃지 않는다(485→485, 921→921,
+    960→960 실측) — 진짜 드리프트는 창 중앙값도 함께 움직이기 때문이다.
     """
-    text = md_path.read_text(encoding="utf-8")
-    hits = [(int(m.group(1)), int(m.group(2)), m.span())
-            for m in _PAGE_HEAD_NO.finditer(text)]
-    if not hits:
-        return 0
-    offs = {pdf: pdf - pr for pdf, pr, _s in hits}
-    drop: list[tuple[int, int]] = []
-    for pdf, _pr, span in hits:
+    offs = {pdf: pdf - pr for pdf, pr in pairs}
+    keep = []
+    for pdf, pr in pairs:
         near = sorted(o for p, o in offs.items()
                       if p != pdf and abs(p - pdf) <= PAGE_NO_WINDOW)
         if len(near) < PAGE_NO_MIN_VOTES:
-            drop.append(span)
+            continue          # 고립된 값은 검증할 수 없다
+        if abs(offs[pdf] - near[len(near) // 2]) > PAGE_NO_TOL:
             continue
-        med = near[len(near) // 2]
-        if abs(offs[pdf] - med) > PAGE_NO_TOL:
-            drop.append(span)
-    if not drop:
-        return 0
+        keep.append((pdf, pr))
+    return keep
+
+
+def rising_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """인쇄 번호가 PDF 쪽 순서대로 증가하는 최장 부분열만 남긴다.
+
+    책의 인쇄 쪽번호는 뒤로 갈수록 반드시 커진다. 이웃 대조를 통과하고도
+    앞 값과 같거나 작은 값은(앞표지·화보의 아라비아 숫자 오독) 그 자체로
+    증거가 부정한다. 최장 증가 부분열을 남기면 역행이 0이 된다.
+    """
+    if not pairs:
+        return []
+    pairs = sorted(pairs)
+    tails: list[int] = []      # tails[i] = 길이 i+1 부분열의 최소 끝값
+    tail_at: list[int] = []    # 그 부분열의 마지막 원소 인덱스
+    prev: list[int | None] = [None] * len(pairs)
+    for i, (_pdf, pr) in enumerate(pairs):
+        j = bisect_left(tails, pr)
+        if j == len(tails):
+            tails.append(pr)
+            tail_at.append(i)
+        else:
+            tails[j] = pr
+            tail_at[j] = i
+        prev[i] = tail_at[j - 1] if j > 0 else None
+    out, cur = [], tail_at[len(tails) - 1]
+    while cur is not None:
+        out.append(pairs[cur])
+        cur = prev[cur]
+    return out[::-1]
+
+
+def fill_page_numbers(pairs: list[tuple[int, int]],
+                      gap: int = PAGE_NO_FILL_GAP) -> list[tuple[int, int]]:
+    """오프셋이 같은 두 확정값 사이의 빈 쪽을 메운다.
+
+    산술 환산이 아니다 — 앞뒤 두 앵커가 모두 검증됐고 그 사이에서 오프셋이
+    변하지 않았음을 두 값이 함께 증명할 때만 메운다(b-a == n_b-n_a). 인쇄
+    쪽번호는 번호가 찍히지 않은 쪽에도 매겨지므로, 구간 안의 모든 쪽은
+    앵커에서 한 칸씩 센 값이다. 오프셋이 다르면 구간 안에서 무언가 어긋난
+    것이므로 손대지 않는다. 폭을 20쪽으로 제한하는 것도 같은 이유다 —
+    구간이 길수록 상쇄되는 두 개의 스캔 사고가 숨을 여지가 커진다.
+
+    실측 회수율: 92.4%→95.6%, 94.1%→96.8%, 91.6%→97.2%, 21.9%→39.8%.
+    """
+    got = dict(pairs)
+    out = dict(pairs)
+    keys = sorted(got)
+    for a, b in zip(keys, keys[1:]):
+        if b - a < 2 or b - a > gap:
+            continue
+        if b - a != got[b] - got[a]:
+            continue
+        for p in range(a + 1, b):
+            out[p] = got[a] + (p - a)
+    return sorted(out.items())
+
+
+def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
+    """인쇄 쪽번호를 확정한다. 반환: (지운 수, 채운 수, 바로잡은 수).
+
+    오탐을 지우고, 확정값이 증명하는 빈칸을 메운다. 오탐이 지워진 자리에
+    앵커가 다른 값을 증명하면 그 자리는 '바로잡힌' 것이다(실측: 반도체
+    PDF 200쪽 '인쇄 178쪽' → 실제 머리말 175쪽).
+
+    확인 못 한 쪽번호는 없는 것보다 나쁘다 — AI가 그 값을 믿고 엉뚱한 쪽을
+    읽는다. 반대로 두 앵커가 증명하는 쪽번호를 비워 두는 것도 손해다.
+    """
+    text = md_path.read_text(encoding="utf-8")
+    hits = [(int(m.group(1)), int(m.group(2)) if m.group(2) else None, m.span())
+            for m in _PAGE_HEAD_ANY.finditer(text)]
+    if not hits:
+        return 0, 0
+    have = [(p, n) for p, n, _s in hits if n is not None]
+    final = dict(fill_page_numbers(rising_page_numbers(confirm_page_numbers(have))))
+    dropped = added = fixed = 0
     out, last = [], 0
-    for s, e in drop:
+    for pdf, old, (s, e) in hits:
+        new = final.get(pdf)
+        if new == old:
+            continue
+        if new is None:
+            dropped += 1
+        elif old is None:
+            added += 1
+        else:
+            fixed += 1
+        head = f"## {pdf}페이지" + (f" (인쇄 {new}쪽)" if new is not None else "")
         out.append(text[last:s])
-        out.append(re.sub(r" \(인쇄 \d+쪽\)$", "", text[s:e]))
+        out.append(head)
         last = e
+    if not out:
+        return 0, 0, 0
     out.append(text[last:])
     md_path.write_text("".join(out), encoding="utf-8")
-    return len(drop)
+    return dropped, added, fixed
 
 
 def insert_glossary(md_path: Path) -> int:
@@ -1218,6 +1318,28 @@ def precompute_page(page_image):
     import pdf_math
 
     return pdf_layout.analyze(page_image), pdf_math.find_formulas(page_image)
+
+
+_PROSE_HANGUL = re.compile(r"[가-힣]")
+_PROSE_WORD = re.compile(r"[A-Za-z]{3,}")
+TEXTBOX_MIN_AREA = 0.10     # 페이지 면적의 이만큼을 넘는 그림만 글상자 후보
+TEXTBOX_MIN_HANGUL = 40     # 한글 산문으로 인정할 최소 글자수
+TEXTBOX_MIN_WORDS = 15      # 영문 산문으로 인정할 최소 낱말수(3글자 이상)
+TEXTBOX_LINE_LETTERS = 6    # 상자 안에서 '문장 줄'로 칠 최소 실질 글자수
+TEXTBOX_MIN_TINT = 0.15     # 바탕이 이만큼 칠해져 있어야 글상자 후보
+TEXTBOX_MAX_PER_PAGE = 2    # 한 쪽에서 다시 읽어 볼 상자 수 상한
+
+
+def looks_like_prose(text: str) -> bool:
+    """크롭 OCR 결과가 '도표 라벨'이 아니라 '문장'인지 판정한다.
+
+    색 배경 예제·정리 상자는 레이아웃 모델이 통째로 그림으로 잡는다. 상자를
+    한 번 더 읽어 이 판정을 통과하면 글상자이므로 본문으로 되살린다. 도표는
+    라벨이 짧고 흩어져 있어 통과하지 못한다 — 실측: 회로도 한 장의 실질
+    글자는 약 25자('Vcc Vb Q3 Q4 Vout Vin1 Vin2 IEE'), 한글은 0자다.
+    """
+    return (len(_PROSE_HANGUL.findall(text)) >= TEXTBOX_MIN_HANGUL
+            or len(_PROSE_WORD.findall(text)) >= TEXTBOX_MIN_WORDS)
 
 
 _PAGE_NO_TOKEN = re.compile(r"(?<![\d.])(\d{1,4})(?![\d.])")
@@ -1440,6 +1562,45 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     # (대학물리 +13→+8→+4→-3, 대학수학 +8→+5). 쪽마다 새기는 수밖에 없다.
     printed_no = read_printed_page(page, page_image, tmp_dir, page_no)
 
+    # 색 배경 글상자 되살리기: 교재의 예제·정리 상자는 배경에 색이 깔려 있어
+    # 레이아웃 모델이 통째로 FIGURE로 잡는다. 그러면 전면 OCR 마스크가 상자
+    # 안을 아예 읽지 않아, 문제문·풀이·식이 본문에서 통째로 사라진다 —
+    # 전자회로 교재 실측 84쪽, 그 쪽들의 본문은 책 평균의 58%뿐이었다
+    # (내용 자체는 그림 PNG에 남지만 검색이 되지 않는다).
+    # 충분히 큰 그림 영역만 개별 크롭으로 한 번 더 읽어, 문장이 나오면
+    # 글상자로 보고 본문으로 되살리고 그림 취급에서 뺀다. 표(TABLE)는 제외한다 —
+    # 틀린 표는 표가 없는 것보다 나쁘므로 통째로 PNG에 남기는 원칙을 지킨다.
+    textbox_recovered: list[dict] = []
+    if not embedded:
+        _page_area = page_image.width * page_image.height
+        # 크롭 OCR은 페이지 한 장을 다시 읽는 것과 비슷한 비용이다 — 큰 그림을
+        # 모두 다시 읽으면 변환 시간이 배로 뛴다. 그래서 후보를 먼저 좁힌다:
+        # 바탕이 옅게 칠해진 영역만, 그것도 큰 것 두 개까지. 글상자는 바탕색으로
+        # 본문과 구분되게 조판돼 있고, 흰 바탕의 도표는 이 문턱을 넘지 못한다
+        # (실측: 예제 상자 59~60%, 흰 바탕 도표 0~5%).
+        _cands = [r for r in image_regions
+                  if r.get("type") != "TABLE"
+                  and (r["x1"] - r["x0"]) * (r["y1"] - r["y0"])
+                  >= TEXTBOX_MIN_AREA * _page_area
+                  and tinted_ratio(page_image, r) > TEXTBOX_MIN_TINT]
+        _cands.sort(key=lambda r: -(r["x1"] - r["x0"]) * (r["y1"] - r["y0"]))
+        for _i, r in enumerate(_cands[:TEXTBOX_MAX_PER_PAGE]):
+            rec = ocr_region_lines(
+                hires_image if hires_image is not None else page_image,
+                (r["x0"] * k, r["y0"] * k, r["x1"] * k, r["y1"] * k),
+                tmp_dir, f"box{page_no}_{_i}", hires_dpi)
+            # 도표 라벨('Q3' 'Vout' '(a)')은 짧다 — 문장 줄만 남긴다. 상자 안의
+            # 회로도·그래프는 그림 PNG에 그대로 있으므로 본문에 옮길 이유가 없다.
+            keep = [ln for ln in sorted(rec, key=lambda l: (l["y0"], l["x0"]))
+                    if len(_WORDISH.findall(ln["text"])) >= TEXTBOX_LINE_LETTERS]
+            text = clean_text(" ".join(ln["text"] for ln in keep))
+            if not looks_like_prose(text):
+                continue
+            textbox_recovered.append({"x0": r["x0"], "y0": r["y0"], "x1": r["x1"],
+                                      "y1": r["y1"], "col": r.get("col", 1),
+                                      "type": "TEXT", "text": text, "nocap": True})
+            fig_boxes.remove((r["x0"], r["y0"], r["x1"], r["y1"]))
+
     # 그림 내부에 들어온 줄·수식 라벨 제거 (그림 PNG에 이미 포함되어 중복·잡음이 됨)
     lines = [ln for ln in lines
              if not in_figure(ln)
@@ -1479,6 +1640,10 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     woven: set[int] = set()
     for r in text_regions:
         r["text"] = assemble_region_text(r, weave, woven)
+    # 되살린 글상자를 본문 영역에 합류시킨다(위치가 있으므로 읽기 순서는 자동).
+    # 상자 안의 독립 수식은 위 in_figure 단계에서 이미 살아남았다 — 상자를
+    # 그림 목록에서 뺐기 때문이다(예제의 결과식이 함께 돌아온다).
+    text_regions += textbox_recovered
     # 색 밴드(파란 소제목·예제 표지·강조 박스)의 흰 글씨는 전면 이진화로 사라져
     # 텍스트가 비면 아래 pool에서 탈락한다 — 해당 색 영역만 개별 크롭으로 재인식해
     # 소제목·표지 구조를 복원한다(스캔 경로 전용; 내장 경로는 텍스트 레이어가 있음).
@@ -1576,6 +1741,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
             if id(r) not in used
             and _overlap_ratio(r["x0"], r["x1"], fig["x0"], fig["x1"]) > 0.4
             and _in_band(r)
+            and not r.get("nocap")      # 되살린 글상자는 캡션이 아니다
             and is_caption_like(r["text"])
             # 본문 참조 문장('그림 1.28은 5개의 소자를…')은 캡션이 아니다.
             # 표지+번호로 시작하되 번호 뒤에 조사가 붙으면 참조다(실측 p53).
@@ -1827,9 +1993,10 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
     # 인쇄 쪽번호는 쪽마다 독립으로 읽으므로 오탐이 섞인다 — 이웃과 대조해
     # 걸러낸다(파일이 다 쓰인 뒤라야 이웃을 볼 수 있다).
     try:
-        n_drop = prune_page_number_outliers(out_path)
-        if n_drop:
-            print(f"  [쪽번호] 이웃과 어긋나는 인쇄 쪽번호 {n_drop}개를 지웠습니다")
+        n_drop, n_fill, n_fix = settle_page_numbers(out_path)
+        if n_drop or n_fill or n_fix:
+            print(f"  [쪽번호] 오탐 {n_drop}개 제거 · 앵커로 {n_fill}개 보충"
+                  f" · {n_fix}개 바로잡음")
     except Exception as e:
         print(f"  [쪽번호] 검증을 실행하지 못했습니다: {type(e).__name__}")
 

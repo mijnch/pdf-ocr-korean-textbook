@@ -272,21 +272,92 @@ def _mk(pairs):
 
 # 오프셋이 일정한 계열은 그대로 둔다
 _f = _mk([(i, i - 8) for i in range(100, 116)])
-check("prune keeps consistent", pdf_ocr.prune_page_number_outliers(_f) == 0)
-# 하나만 튀면 그것만 지운다
+check("settle keeps consistent", pdf_ocr.settle_page_numbers(_f) == (0, 0, 0))
+# 하나만 튀면 그것만 지운다 — 그리고 양옆 앵커가 참값을 증명하므로 바로잡는다
 _pairs = [(i, i - 8) for i in range(100, 116)]
 _pairs[7] = (107, 60)                       # 오프셋 +47 — 튄 값
 _f = _mk(_pairs)
-check("prune drops outlier", pdf_ocr.prune_page_number_outliers(_f) == 1)
-_t = _f.read_text(encoding="utf-8")
-check("prune keeps others", _t.count("(인쇄 ") == 15 and "## 107페이지\n" in _t)
+check("settle fixes outlier", pdf_ocr.settle_page_numbers(_f) == (0, 0, 1))
+check("settle fixed value", "## 107페이지 (인쇄 99쪽)" in _f.read_text(encoding="utf-8"))
 # 고립된 값(이웃 표본 부족)은 검증할 수 없으므로 지운다
-check("prune drops isolated",
-      pdf_ocr.prune_page_number_outliers(_mk([(5, 3), (200, 150), (400, 380)])) == 3)
+check("settle drops isolated",
+      pdf_ocr.settle_page_numbers(_mk([(5, 3), (200, 150), (400, 380)])) == (3, 0, 0))
 # 완만한 드리프트는 살린다(책 안에서 오프셋이 서서히 변함)
-check("prune keeps drift",
-      pdf_ocr.prune_page_number_outliers(
-          _mk([(i, i - (8 if i < 108 else 7)) for i in range(100, 116)])) == 0)
+check("settle keeps drift",
+      pdf_ocr.settle_page_numbers(
+          _mk([(i, i - (8 if i < 108 else 7)) for i in range(100, 116)])) == (0, 0, 0))
+# ±3 오탐은 예전 허용치(3)를 통과했다 — 반도체 교재 실측(오프셋 25에 22·27이 섞임)
+check("settle tol drops near-miss",
+      pdf_ocr.confirm_page_numbers([(i, i - 25) for i in range(100, 112)]
+                                   + [(112, 112 - 22)]) == [(i, i - 25) for i in range(100, 112)])
+# 인쇄 번호가 역행하면 그 자체로 오독이다 — 최장 증가 부분열만 남긴다
+check("rising drops backslide",
+      pdf_ocr.rising_page_numbers([(1, 10), (2, 11), (3, 4), (4, 13), (5, 14)])
+      == [(1, 10), (2, 11), (4, 13), (5, 14)])
+check("rising keeps monotone",
+      len(pdf_ocr.rising_page_numbers([(i, i - 5) for i in range(20, 40)])) == 20)
+# 앵커 사이 보간: 양 끝 오프셋이 같을 때만, 그리고 정해진 폭 안에서만 메운다
+check("fill between anchors",
+      pdf_ocr.fill_page_numbers([(10, 2), (14, 6)]) ==
+      [(10, 2), (11, 3), (12, 4), (13, 5), (14, 6)])
+check("fill refuses offset change",
+      pdf_ocr.fill_page_numbers([(10, 2), (14, 7)]) == [(10, 2), (14, 7)])
+check("fill refuses wide gap",
+      pdf_ocr.fill_page_numbers([(10, 2), (60, 52)]) == [(10, 2), (60, 52)])
+# 되풀이 적용해도 결과가 같아야 한다(스플라이스 후 재실행)
+_f = _mk([(i, i - 8) for i in range(100, 116)])
+pdf_ocr.settle_page_numbers(_f)
+check("settle idempotent", pdf_ocr.settle_page_numbers(_f) == (0, 0, 0))
+
+# ─── looks_like_prose: 색 배경 글상자와 도표 라벨 가르기 ───
+check("prose korean box", pdf_ocr.looks_like_prose(
+    "그림 10.17(a)는 그림 10.16(a)에 주어진 토폴로지의 구현을 설명하고 있다. "
+    "차동 전압 이득을 계산하라. 각 pnp 소자가 출력 노드에서 저항을 생성한다."))
+check("prose circuit labels not",
+      not pdf_ocr.looks_like_prose("Vcc Vb Q3 Q4 Vout Vin1 Vin2 P IEE (a) (b)"))
+check("prose graph legend not",
+      not pdf_ocr.looks_like_prose("IC Forward Active Region VCE V1 IS exp"))
+check("prose english box", pdf_ocr.looks_like_prose(
+    "The transfer function of the network shown above may be obtained by writing "
+    "a node equation at the output and solving for the resulting ratio between "
+    "output voltage and input voltage across the passive elements."))
+
+# ─── tinted_ratio: 옅은 색 상자와 흰 바탕 도표 가르기 (실측값 고정) ───
+from PIL import Image as _PILImage  # noqa: E402
+
+
+def _swatch(rgb, w=60, h=40):
+    return _PILImage.new("RGB", (w, h), rgb)
+
+
+_box = {"x0": 0, "y0": 0, "x1": 60, "y1": 40}
+# 아주 옅은 하늘색 상자(전자회로 예제 상자와 같은 계열) — 채도 기준은 못 잡는다
+check("tint pale blue box", pdf_ocr.tinted_ratio(_swatch((230, 240, 250)), _box) > 0.9)
+check("tint pale blue misses saturation gate",
+      pdf_ocr.colored_ratio(_swatch((230, 240, 250)), _box) == 0.0)
+check("tint white page", pdf_ocr.tinted_ratio(_swatch((255, 255, 255)), _box) == 0.0)
+check("tint grey not tinted", pdf_ocr.tinted_ratio(_swatch((240, 240, 240)), _box) == 0.0)
+check("tint dark photo not", pdf_ocr.tinted_ratio(_swatch((40, 90, 160)), _box) == 0.0)
+
+# ─── merge_rescue_lines: 어긋난 중복이 문단에 끼어드는 것 차단 ───
+def _ln(t, y0, y1, x0=0, x1=500, conf=90):
+    return {"text": t, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "conf": conf}
+
+
+# 세로로 절반 넘게 겹치면 같은 줄 — 중심점이 틈에 떨어져도 막힌다
+_pri = [_ln("반도체 내에 전하 캐리어의 전송현상을 다루고 있다", 100, 120)]
+check("rescue blocks shifted overlap",
+      pdf_text.merge_rescue_lines(_pri, [_ln("반도체 내에 전하 캐리어의 전송현상을", 112, 132)]) == 0)
+# 위치가 완전히 달라도 내용이 메아리면 막는다
+_pri = [_ln("반도체 내에 전하 캐리어의 전송현상을 다루고 있다", 100, 120)]
+check("rescue blocks echo",
+      pdf_text.merge_rescue_lines(
+          _pri, [_ln("반도체 내에 전하 캐리어의 전송현상율 다루고", 400, 420)]) == 0)
+# 진짜로 빠진 줄은 여전히 보충한다(p567 회귀 — 이 기능의 존재 이유)
+_pri = [_ln("반도체 내에 전하 캐리어의 전송현상을 다루고 있다", 100, 120)]
+check("rescue still adds missing",
+      pdf_text.merge_rescue_lines(
+          _pri, [_ln("불평형 과잉 캐리어 특성을 설명한다", 400, 420)]) == 1)
 
 # ─── 캡션 띠: 표지 없는 글은 그림 바로 아래로 제한 ───
 # (기하 배선은 process_page 안이라 여기서는 판정 함수만 고정한다)

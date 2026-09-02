@@ -277,12 +277,12 @@ def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_
     return best, ok, err_txt
 
 
-def ocr_region_text(image, box, tmp_dir: Path, name: str, dpi: int = RENDER_DPI) -> str:
-    """영역 하나를 개별 크롭으로 OCR해 한 줄 텍스트로 반환한다.
+def _prep_region_crop(image, box):
+    """영역 크롭을 OCR 하기 좋게 다듬는다. 반환: (크롭, x0, y0, 확대배율) 또는 None.
 
     색 밴드(파란 소제목·예제 표지 등)의 흰 글씨는 전면 이진화로 사라지기 쉽다.
     영역만 잘라 국소 이진화하고, 배경이 어두우면(중앙 밝기<140) 반전해
-    '어두운 글씨·밝은 배경'으로 만들어 인식률을 높인다.
+    '어두운 글씨·밝은 배경'으로 만든다.
     """
     from PIL import ImageOps, ImageStat
 
@@ -290,14 +290,66 @@ def ocr_region_text(image, box, tmp_dir: Path, name: str, dpi: int = RENDER_DPI)
     x1 = min(image.width, int(box[2]))
     y1 = min(image.height, int(box[3]))
     if x1 - x0 < 8 or y1 - y0 < 8:
-        return ""
+        return None
     crop = image.crop((x0, y0, x1, y1)).convert("L")
     if ImageStat.Stat(crop).median[0] < 140:
         crop = ImageOps.invert(crop)
     # 소제목 밴드의 작은 번호(8.14 등)는 원배율에서 자주 깨진다 — 2배 확대하면
     # Tesseract 인식이 크게 좋아진다(실측: 'EXT'→'8.14'). 과대 이미지는 캡한다.
+    scale = 1
     if crop.width < 1600 and crop.height < 400:
         crop = crop.resize((crop.width * 2, crop.height * 2))
+        scale = 2
+    return crop, x0, y0, scale
+
+
+def ocr_region_lines(image, box, tmp_dir: Path, name: str,
+                     dpi: int = RENDER_DPI) -> list[dict]:
+    """영역 하나를 개별 크롭으로 OCR해 **줄 목록**으로 반환한다(좌표는 원본 공간).
+
+    ocr_region_text가 한 줄로 뭉쳐 돌려주는 것과 달리, 줄 구조를 살린다 —
+    색 배경 예제 상자를 본문으로 되살릴 때 도표 라벨('Q3', 'Vout')과 문장을
+    가르려면 줄 단위 길이가 필요하다.
+    """
+    prep = _prep_region_crop(image, box)
+    if prep is None:
+        return []
+    crop, x0, y0, scale = prep
+    path = tmp_dir / f"{name}.png"
+    crop.save(path)
+    base = tmp_dir / f"{name}_l"
+    proc = start_tesseract(path, "6", base, dpi)
+    try:
+        proc.communicate(timeout=PAGE_OCR_TIMEOUT)
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        lines = load_tesseract_result(base)
+    except OSError:
+        return []
+    for ln in lines:
+        ln["x0"] = ln["x0"] / scale + x0
+        ln["x1"] = ln["x1"] / scale + x0
+        ln["y0"] = ln["y0"] / scale + y0
+        ln["y1"] = ln["y1"] / scale + y0
+        ln.pop("words", None)          # 좌표계가 달라진 단어 경계는 버린다
+    return lines
+
+
+def ocr_region_text(image, box, tmp_dir: Path, name: str, dpi: int = RENDER_DPI) -> str:
+    """영역 하나를 개별 크롭으로 OCR해 한 줄 텍스트로 반환한다."""
+    prep = _prep_region_crop(image, box)
+    if prep is None:
+        return ""
+    crop = prep[0]
     path = tmp_dir / f"{name}.png"
     crop.save(path)
     base = tmp_dir / f"{name}_o"
@@ -452,32 +504,61 @@ def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
     return lines
 
 
+_SHINGLE_CH = re.compile(r"[0-9a-z가-힣]")
+SHINGLE_LEN = 8          # 메아리 판정에 쓰는 글자 토막 길이
+RESCUE_VOVERLAP = 0.5    # 세로로 이만큼 겹치면 같은 줄로 본다
+RESCUE_ECHO = 0.5        # 이미 읽은 토막을 이만큼 재탕하면 메아리다
+
+
+def _shingles(text: str) -> set[str]:
+    """글자만 남긴 뒤 길이 SHINGLE_LEN 토막 집합으로 만든다(공백·문장부호 무시)."""
+    s = "".join(_SHINGLE_CH.findall(text.lower()))
+    return {s[i:i + SHINGLE_LEN] for i in range(len(s) - SHINGLE_LEN + 1)}
+
+
 def merge_rescue_lines(primary: list[dict], rescue: list[dict]) -> int:
     """기준 해상도 OCR(rescue)에서만 잡힌 줄을 주 결과(primary)에 보충한다.
 
     고해상(400dpi) 입력에서 Tesseract 레이아웃 분석이 짧은 들여쓰기 줄(불릿 항목
     등)을 PSM 불문 통째로 놓치는 사례가 실측됐다(공학수학 p567 — 두 줄 무음 소실).
-    기준 해상도에서는 같은 줄이 정상 인식되므로, 주 결과와 세로로 겹치지 않는
-    구조 줄만 추가한다(겹치면 이미 있는 줄이므로 중복 삽입하지 않는다).
+    기준 해상도에서는 같은 줄이 정상 인식되므로, 주 결과에 없는 줄만 추가한다.
     두 결과는 같은 좌표 공간(기준 해상도)이어야 한다. 반환: 보충한 줄 수.
 
     보충 줄은 주 결과에 없던 것이라 검증 상대가 없으므로, 주 줄(신뢰도 35 통과)보다
     높은 정밀도 기준을 요구한다 — 신뢰도 RESCUE_MIN_CONF 미만이거나 실질 글자가
     너무 적은(<RESCUE_MIN_WORDISH) 파편은 버린다. 밀집 2단 스캔에서 다른 PSM/해상도가
     이미 읽은 내용을 조각으로 잘못 덧읽는 것('닌 모', 'ATH TE To')을 차단한다.
+
+    '같은 줄'을 중심점 포함으로 보던 예전 판정은 새는 문이었다 — 두 PSM이 줄을
+    다르게 자르면 보충 줄의 중심이 주 줄 사이 틈에 떨어져 중복이 통과했고, 같은
+    문장이 서로 다르게 깨진 채 문단 한가운데 끼어들었다(반도체 교재 40.3%,
+    전자회로 27.3%의 쪽에서 검출). 그래서 두 겹으로 막는다:
+      ① 세로 겹침 비율 — 짧은 쪽 높이의 RESCUE_VOVERLAP 이상 겹치면 같은 줄이다.
+      ② 내용 메아리 — 이미 읽은 글의 글자 토막을 RESCUE_ECHO 이상 재탕하면,
+         위치가 어긋나 있어도 같은 내용의 다른 판독이다. 위치 판정이 못 잡는
+         '어긋난 중복'은 이쪽에서 걸린다.
     """
     added = 0
+    seen = set()
+    for p in primary:
+        seen |= _shingles(p.get("text", ""))
     for s in rescue:
         if s.get("conf", 100) < RESCUE_MIN_CONF:
             continue
         if len(_WORDISH.findall(s["text"])) < RESCUE_MIN_WORDISH:
             continue
-        cy = (s["y0"] + s["y1"]) / 2
-        dup = any(p["y0"] <= cy <= p["y1"]
-                  and min(p["x1"], s["x1"]) > max(p["x0"], s["x0"])
+        h = max(1.0, s["y1"] - s["y0"])
+        dup = any(min(p["x1"], s["x1"]) > max(p["x0"], s["x0"])
+                  and (min(p["y1"], s["y1"]) - max(p["y0"], s["y0"]))
+                  >= RESCUE_VOVERLAP * min(h, max(1.0, p["y1"] - p["y0"]))
                   for p in primary)
         if not dup:
+            sh = _shingles(s["text"])
+            if sh and len(sh & seen) >= RESCUE_ECHO * len(sh):
+                dup = True                    # 위치는 달라도 내용이 메아리다
+        if not dup:
             primary.append(s)
+            seen |= _shingles(s["text"])      # 보충 줄끼리의 중복도 막는다
             added += 1
     return added
 
