@@ -132,13 +132,20 @@ def count_spans(md_text: str) -> tuple[int, int]:
 
 
 def recount_marker(md_text: str) -> str:
-    """완료 표식의 페이지·수식 수를 파일 실측값으로 갱신해 돌려준다(스플라이스 후 사용).
+    """완료 표식의 페이지·수식 수를 파일 실측값으로 갱신해 돌려준다.
 
     표식이 없으면 끝에 새로 붙인다. 실패 페이지 수도 본문 실측으로 다시 센다.
+
+    라벨이 '검출 수식'이 아니라 '수식'인 이유: 검출 수(MFD가 찾은 상자 수)와
+    수록 수(최종 문서에 남은 수식 수)는 다르다 — 빈 LaTeX·그림 안 라벨은
+    탈락하기 때문이다(실측 전기회로이론: 검출 24,340 vs 수록 14,105). 예전에는
+    변환이 검출 수를, 스플라이스가 수록 수를 **같은 라벨에** 적어, 스플라이스를
+    한 번 돌리면 표식의 뜻이 조용히 바뀌었다. 지금은 양쪽 다 이 함수를 거쳐
+    파일에 실제로 든 수를 적는다 — 누구든 세어서 확인할 수 있는 값이다.
     """
     pages, n_f = count_spans(md_text)
     failed = md_text.count("(이 페이지는 인식에 실패했습니다")
-    marker = (f"> [변환 완료] {pages}페이지, 검출 수식 {n_f}개"
+    marker = (f"> [변환 완료] {pages}페이지, 수식 {n_f}개"
               + (f", 실패 {failed}페이지" if failed else ""))
     if _DONE.search(md_text):
         return _DONE.sub(lambda _m: marker, md_text, count=1)

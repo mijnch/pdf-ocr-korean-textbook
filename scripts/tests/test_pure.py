@@ -334,6 +334,37 @@ check("prose english box", pdf_ocr.looks_like_prose(
     "a node equation at the output and solving for the resulting ratio between "
     "output voltage and input voltage across the passive elements."))
 
+# ─── geometric_gutter: 좌표만으로 칼럼 경계 찾기 ───
+def _gr(x0, x1, y0):
+    return {"kind": "text", "x0": x0, "x1": x1, "y0": y0, "y1": y0 + 90}
+
+
+# 왼쪽 여백 상자 + 오른쪽 본문 → 경계를 찾는다(대학물리 p647 형태)
+_side = [_gr(97, 479, 250), _gr(102, 286, 200), _gr(95, 480, 1823),
+         _gr(500, 1531, 353), _gr(499, 1530, 583), _gr(500, 1532, 964)]
+_g = pdf_ocr.geometric_gutter(_side, 1674)
+check("gutter sidebar found", _g is not None and 440 <= _g <= 499)  # 실측 458
+# 단일 칼럼: 어느 x든 본문이 가로질러 경계가 없다
+check("gutter single none",
+      pdf_ocr.geometric_gutter([_gr(300, 1450, y) for y in (200, 400, 600, 800)], 1674) is None)
+# 오른쪽 끝의 좁은 라벨 무리로는 경계를 만들지 않는다(폭 조건)
+check("gutter thin side rejected",
+      pdf_ocr.geometric_gutter([_gr(95, 1400, 200), _gr(95, 1400, 400),
+                                _gr(1455, 1521, 500), _gr(1455, 1521, 759)], 1674) is None)
+# 깨끗한 2단은 가운데에서 갈린다
+check("gutter two column",
+      (lambda g: g is not None and 800 <= g <= 900)(
+          pdf_ocr.geometric_gutter([_gr(230, 850, y) for y in (200, 700, 1200)]
+                                   + [_gr(860, 1460, y) for y in (200, 700, 1200)], 1592)))
+
+# ─── 색 상자 재인식 게이트: 망가진 티가 나는 텍스트만 다시 읽는다 ───
+check("callout junk detected",
+      bool(pdf_ocr._CALLOUT_JUNK.search("[ize 2810] 계단함수일 때의 회로응답이며")))
+check("callout clean not flagged",
+      not pdf_ocr._CALLOUT_JUNK.search("7.5 RC 회로의 계단응답"))
+check("callout number not flagged",
+      not pdf_ocr._CALLOUT_JUNK.search("실전문제 7.9 다음의 적분값을 구하라"))
+
 # ─── detect_columns: 오라벨 영역이 거터를 지우는 것 차단 (전자회로 p293 고정) ───
 def _reg(x0, x1, col, y0=0):
     return {"x0": x0, "x1": x1, "y0": y0, "y1": y0 + 100, "col": col}

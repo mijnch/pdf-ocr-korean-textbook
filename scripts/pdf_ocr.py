@@ -469,6 +469,10 @@ _TABLE_CAP_RE = re.compile(r"^표\s*\d")
 # ─────────────────────────── 영역 분류 ───────────────────────────
 
 CALLOUT_COLOR_RATIO = tuning.get("layout", "callout_color_ratio")  # 색 박스 판정
+# 색 상자 안 글이 '망가진 티'를 내는 표식 — 한글 사이에 낀 3자 이상 영숫자 덩어리.
+# 정상 콜아웃의 'RC'(2자)·'7.9'는 걸리지 않고, 오독 '[ize 2810]'은 걸린다.
+_CALLOUT_JUNK = re.compile(r"[A-Za-z0-9]{3,}")
+CALLOUT_REDO_GAIN = 1.15   # 크롭 재인식이 이만큼 더 많이 읽어야 교체한다
 
 
 def colored_ratio(page_image, region: dict) -> float:
@@ -643,6 +647,46 @@ def embedded_layer_agreement(pdf, tmp_dir: Path,
     return statistics.median(vals) if len(vals) >= 3 else None
 
 
+GUTTER_LO, GUTTER_HI = 0.25, 0.75   # 거터가 있을 수 있는 x 구간(페이지 폭 대비)
+GUTTER_PAD = 0.015                  # 이만큼은 걸쳐도 '가로지른다'고 보지 않는다
+GUTTER_MIN_SIDE = 2                 # 양쪽에 각각 이만큼의 영역이 있어야 한다
+GUTTER_MIN_WIDTH = 0.15             # 양쪽 덩어리가 각각 이만큼은 넓어야 한다
+
+
+def geometric_gutter(regions: list[dict], page_w: int) -> float | None:
+    """좌표만 보고 칼럼 경계를 찾는다 — 라벨을 전혀 쓰지 않는다.
+
+    조건: 그 x를 가로지르는 본문 영역이 하나도 없고, 양쪽에 영역이 둘 이상,
+    양쪽 덩어리가 각각 페이지 폭의 15% 이상. 후보가 여럿이면 양쪽 개수가
+    가장 고르게 갈리는 x를 고른다.
+
+    단일 칼럼 페이지에서는 본문 문단이 어느 x든 가로지르므로 자연히 None이
+    나온다(실측: 8권 표본 16쪽 중 단단 12쪽 전부 None). 여백 주석·그림
+    칼럼이 있는 쪽에서만 경계가 잡힌다 — 대학물리 p647 x=458,
+    전기회로이론 p314 x=409, 전자회로 p293 x=830.
+    """
+    texts = [r for r in regions if r.get("kind", "text") == "text"] or regions
+    if len(texts) < 2 * GUTTER_MIN_SIDE:
+        return None
+    pad = GUTTER_PAD * page_w
+    best: tuple[int, float] | None = None
+    for x in range(int(GUTTER_LO * page_w), int(GUTTER_HI * page_w), 4):
+        if any(r["x0"] + pad < x < r["x1"] - pad for r in texts):
+            continue
+        left = [r for r in texts if (r["x0"] + r["x1"]) / 2 < x]
+        right = [r for r in texts if (r["x0"] + r["x1"]) / 2 >= x]
+        if len(left) < GUTTER_MIN_SIDE or len(right) < GUTTER_MIN_SIDE:
+            continue
+        lw = max(r["x1"] for r in left) - min(r["x0"] for r in left)
+        rw = max(r["x1"] for r in right) - min(r["x0"] for r in right)
+        if lw < GUTTER_MIN_WIDTH * page_w or rw < GUTTER_MIN_WIDTH * page_w:
+            continue
+        bal = min(len(left), len(right))
+        if best is None or bal > best[0]:
+            best = (bal, float(x))
+    return best[1] if best else None
+
+
 def clean_column_bands(regions: list[dict], page_w: int) -> dict[int, tuple[float, float]]:
     """칼럼별 x 범위 — 단, 제 칼럼 중앙값에서 크게 벗어난 영역은 빼고 구한다.
 
@@ -728,9 +772,16 @@ def order_flow(flow: list[dict], layout_texts: list[dict], page_w: int) -> list[
     # 거터가 사라지고, 2단 페이지가 행 단위 좌→우로 읽혀 좌·우 문제가 번갈아
     # 나온다(실측 전자회로 p293: 5.48→5.52→5.49→5.53 순).
     bands = sorted(clean_column_bands(layout_texts, page_w).values())
-    gutter = None
-    if len(bands) == 2 and bands[1][0] - bands[0][1] > -0.05 * page_w:
-        gutter = (bands[0][1] + bands[1][0]) / 2
+    gutter = geometric_gutter(layout_texts, page_w)
+    if gutter is None and len(bands) == 2 and bands[1][0] - bands[0][1] > -0.05 * page_w:
+        cand = (bands[0][1] + bands[1][0]) / 2
+        # 라벨에서 나온 거터는 페이지 한가운데 언저리일 때만 받는다. 수식 번호
+        # 라벨 두어 개가 오른쪽 끝에서 제 칼럼 번호를 받으면 거터가 폭의 89%
+        # 지점에 잡히고(실측 대학물리 p647: x=1494/1674), 그러면 페이지 전체가
+        # 한 칼럼이 되어 행 단위로 읽힌다 — 왼쪽 여백 상자가 본문 문단 사이로
+        # 끼어드는 원인이다. 기하 판정이 같은 쪽에서 x=458을 정확히 찾는다.
+        if GUTTER_LO * page_w <= cand <= GUTTER_HI * page_w:
+            gutter = cand
     if gutter is None:
         if len(bands) >= 3:  # 3단 이상(희귀): 라벨 순서를 그대로 신뢰
             for b in flow:
@@ -1764,13 +1815,24 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     if not embedded:
         base_img = hires_image if hires_image is not None else page_image
         for idx, r in enumerate(text_regions):
-            if len(_WORDISH.findall(r["text"])) >= 2:
+            cur = len(_WORDISH.findall(r["text"]))
+            # 비어 있을 때만이 아니라 '망가진 티가 날 때'도 다시 읽는다. 색 상자
+            # 안의 강조 글자는 전면 이진화에서 통째로 사라지는 대신 엉뚱한 낱말로
+            # 뭉개지기도 한다 — 실측(전기회로이론 p314): 원본 '회로의 계단응답은
+            # 전원이 …'가 '[ize 2810] …'로 나왔고, 상자 둘째 줄('이 될 수 있다')은
+            # 아예 빠졌다. 텍스트가 비지 않았으므로 예전 조건에는 걸리지 않았다.
+            # 같은 영역을 국소 이진화로 크롭해 읽으면 문장이 온전히 나온다.
+            if cur >= 2 and not _CALLOUT_JUNK.search(r["text"]):
                 continue
             if colored_ratio(page_image, r) <= CALLOUT_COLOR_RATIO:
                 continue
             box = (r["x0"] * k, r["y0"] * k, r["x1"] * k, r["y1"] * k)
             rec = ocr_region_text(base_img, box, tmp_dir, f"band{page_no}_{idx}", hires_dpi)
-            if len(_WORDISH.findall(rec)) >= 2:
+            got = len(_WORDISH.findall(rec))
+            # 글자가 뚜렷하게 더 많을 때만 바꾼다 — 크롭이 상자의 일부만 읽어
+            # 오히려 짧아지는 경우에 본문을 잃지 않기 위해서다(실측: 같은 쪽의
+            # '실전문제 7.9' 상자는 크롭이 더 짧아 기존 텍스트가 유지된다).
+            if got >= 2 and got > max(cur * CALLOUT_REDO_GAIN, cur + 2):
                 r["text"] = rec
         # 장 표지 제목 되살리기: 레이아웃이 상단의 '큰' 제목(사진 위에 박힌 장 제목
         # 등)을 러닝 헤더처럼 drop으로 버리는 경우가 있다. 러닝 헤더는 얇으므로(≈2%H),
@@ -2113,6 +2175,14 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
     # 자가 감사: 방금 저장한 산출물의 결함(낙오 $·중괄호·깨진 링크·페이지 수)을
     # 인쇄 쪽번호는 쪽마다 독립으로 읽으므로 오탐이 섞인다 — 이웃과 대조해
     # 걸러낸다(파일이 다 쓰인 뒤라야 이웃을 볼 수 있다).
+    try:  # 표식의 수식 수를 파일 실측으로 통일한다(스플라이스와 같은 뜻이 되게)
+        import pdf_audit as _audit
+        out_path.write_text(
+            _audit.recount_marker(out_path.read_text(encoding="utf-8")),
+            encoding="utf-8")
+    except Exception as e:
+        print(f"  [표식] 실측 갱신을 못 했습니다: {type(e).__name__}")
+
     try:
         n_drop, n_fill, n_fix = settle_page_numbers(out_path)
         if n_drop or n_fill or n_fix:
