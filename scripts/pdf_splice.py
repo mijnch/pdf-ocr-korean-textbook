@@ -27,11 +27,14 @@ from pathlib import Path
 
 from common import exit_with_message, setup_external_tools, tmp_root
 from pdf_ocr import (
+    EMBED_MIN_AGREE,
     HIRES_MAX_DPI,
     RENDER_DPI,
+    embedded_layer_agreement,
     native_scan_dpi,
     process_page,
 )
+import pdf_chapters
 import pdf_audit
 
 
@@ -95,6 +98,17 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
             exit_with_message(f"원본 PDF는 {len(pdf)}페이지입니다: {max(pages)}페이지 없음")
         with tempfile.TemporaryDirectory(dir=tmp_root()) as tmp:
             tmp_dir = Path(tmp)
+            # 전권 변환과 같은 판정을 쓴다 — 스플라이스만 내장층을 덥석 믿으면
+            # 망가진 층을 가진 책의 쪽이 조용히 나빠진다(실측: 전기회로이론
+            # 한 쪽의 낱말 회수율 96.4% → 10.8%).
+            force = pdf_chapters.force_scan(md_path.stem.replace("_OCR", ""))
+            if not force:
+                agree = embedded_layer_agreement(pdf, tmp_dir)
+                if agree is not None:
+                    print(f"  [본문] 내장 텍스트 레이어 신뢰도 {agree * 100:.0f}%")
+                    force = agree < EMBED_MIN_AGREE
+            if force:
+                print("  [본문] 스캔 경로로 인식합니다")
             for pno in pages:
                 page = pdf[pno - 1]
                 page_image = page.render(scale=RENDER_DPI / 72).to_pil()
@@ -107,7 +121,7 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
                 try:
                     page_md, n_f, source, _printed = process_page(
                         page, page_image, images_dir, pno, tmp_dir,
-                        pre=None, hires_image=hires)
+                        pre=None, hires_image=hires, force_scan=force)
                 except Exception as e:
                     print(f"  {pno}페이지 실패 — 기존 절 유지: {type(e).__name__}: {e}")
                     continue

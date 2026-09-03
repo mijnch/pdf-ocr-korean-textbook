@@ -10,6 +10,7 @@ pdf_ocr가 쓰는 인식 I/O를 모아 둔 모듈이다. 페이지 전체 OCR(�
 from __future__ import annotations
 
 import re
+import statistics
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,7 @@ TESS_LANG = tuning.get("recognition", "tess_lang")
 MIN_LINE_CONF = tuning.get("recognition", "min_line_conf")  # 줄 평균 신뢰도 하한
 # 보충 줄(다른 PSM/해상도만 읽은 줄)의 정밀도 기준 — 주 줄(35)보다 높다. 실측:
 # 진짜 누락 본문 신뢰도 86~94, 밀집 스캔의 오독 파편 36~39로 간격이 커 60에서 분리.
+COL_OUTLIER_RATIO = 0.25   # 제 칼럼 중앙값에서 이만큼(페이지 폭 대비) 벗어나면 오라벨
 RESCUE_MIN_CONF = tuning.get("recognition", "rescue_min_conf")
 RESCUE_MIN_WORDISH = tuning.get("recognition", "rescue_min_wordish")
 MASK_MARGIN = tuning.get("recognition", "mask_margin")
@@ -222,15 +224,39 @@ def detect_columns(layout_texts: list[dict], page_w: int) -> list[tuple[int, int
         c = r.get("col", 1)
         if c >= 1:
             cols.setdefault(c, []).append(r)
-    if len(cols) < 2 or any(len(rs) < 2 for rs in cols.values()):
+    if len(cols) < 2:
         return None
-    bands = sorted((min(r["x0"] for r in rs), max(r["x1"] for r in rs)) for rs in cols.values())
+    # 오라벨 영역 제거: 레이아웃 모델은 이따금 오른쪽 단의 문단에 왼쪽 단 번호를
+    # 붙인다. 그러면 그 한 영역이 밴드를 페이지 폭의 78%까지 늘려 거터가 사라지고,
+    # 2단 페이지가 통째로 단일 취급되어 Tesseract가 좌·우를 가로질러 읽는다
+    # (실측: 전자회로 p293 — 문제 5.49 문장 한가운데 5.53 문장이 끼어들었고,
+    # 그 쪽의 문자 일치율이 62.4%로 떨어졌다. 같은 책 단단 쪽은 94.1%).
+    # 제 칼럼 중앙값에서 페이지 폭의 25% 넘게 떨어진 영역은 라벨을 믿지 않는다.
+    kept: dict[int, list[dict]] = {}
+    for c, rs in cols.items():
+        med = statistics.median((r["x0"] + r["x1"]) / 2 for r in rs)
+        keep = [r for r in rs
+                if abs((r["x0"] + r["x1"]) / 2 - med) <= COL_OUTLIER_RATIO * page_w]
+        if len(keep) < 2:
+            return None
+        kept[c] = keep
+    bands = sorted((min(r["x0"] for r in rs), max(r["x1"] for r in rs)) for rs in kept.values())
     for a, b in zip(bands, bands[1:]):
         if b[0] <= a[1]:                       # 밴드가 겹침 → 거터 불명확 → 단일 취급
             return None
     if any((x1 - x0) > 0.7 * page_w for x0, x1 in bands):
         return None
-    return bands
+    # 밴드 경계를 거터 한가운데로 맞추고 양 끝을 본문 전체 범위까지 넓힌다 —
+    # 걸러낸 오라벨 영역의 글도 어느 한쪽 밴드에는 반드시 들어가게 해서,
+    # 잘못 붙은 라벨 때문에 본문이 잘려 나가는 일이 없게 한다.
+    lo = min(r["x0"] for r in layout_texts)
+    hi = max(r["x1"] for r in layout_texts)
+    out: list[tuple[int, int]] = []
+    for i, (x0, x1) in enumerate(bands):
+        a = lo if i == 0 else (bands[i - 1][1] + x0) / 2
+        b = hi if i == len(bands) - 1 else (x1 + bands[i + 1][0]) / 2
+        out.append((a, b))
+    return out
 
 
 def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_DPI):

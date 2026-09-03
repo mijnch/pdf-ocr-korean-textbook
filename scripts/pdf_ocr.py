@@ -586,6 +586,87 @@ def column_bands(regions: list[dict]) -> dict[int, tuple[float, float]]:
     return bands
 
 
+_AGREE_TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z]{3,}")
+EMBED_MIN_AGREE = 0.75   # 내장층 토큰이 Tesseract 판독과 이만큼은 겹쳐야 신뢰한다
+EMBED_PROBE_PAGES = 12   # 판정에 쓰는 표본 쪽 수
+EMBED_PROBE_MIN_TOKENS = 15
+
+
+def embedded_layer_agreement(pdf, tmp_dir: Path,
+                             sample: int = EMBED_PROBE_PAGES) -> float | None:
+    """내장 텍스트층이 믿을 만한지 표본 쪽에서 Tesseract와 맞대어 잰다.
+
+    반환: 내장층 토큰 중 Tesseract도 읽은 것의 비율(중앙값). 층이 없거나
+    표본이 모자라면 None(판정 없음 → 기존 동작 유지).
+
+    왜 필요한가: 어떤 책의 내장층은 출판사 선행 OCR이라 한글을 한 글자씩
+    띄워 놓아('각 상 당 평 균 전 력') 그대로 쓰면 본문이 무너진다. 지금까지는
+    사람이 장구분.toml에 force_scan을 적어 막았는데, **그 파일이 없어지면
+    아무 경고 없이 망가진 층이 채택된다.** 실측으로 확인했다 — 전기회로이론
+    한 쪽의 낱말 회수율이 96.4%에서 10.8%로 떨어졌고, 자가 감사는 원본과
+    대조하지 않으므로 결함을 한 건도 보고하지 않았다.
+
+    문턱 0.75는 4권 실측에서 얻었다(각 12쪽 표본의 중앙값):
+      전기회로이론 67.9% · 대학수학 81.0% · 대학물리 91.9% · 신호와시스템 97.1%
+    망가진 책과 정상 책 사이가 13포인트 벌어져 있어 그 사이에 둔다.
+    설정 파일이 있으면 그쪽이 우선이다 — 이 판정은 그물이지 대체물이 아니다.
+    """
+    import statistics
+
+    n = len(pdf)
+    if n < 4:
+        return None
+    step = max(1, int(n * 0.6) // sample)
+    vals: list[float] = []
+    for k, i in enumerate(range(int(n * 0.2), int(n * 0.8), step)):
+        if k >= sample:
+            break
+        try:
+            page = pdf[i]
+            tp = page.get_textpage()
+            raw = tp.get_text_bounded()
+            tp.close()
+            src = set(_AGREE_TOKEN.findall(raw))
+            if len(src) < EMBED_PROBE_MIN_TOKENS:
+                page.close()
+                continue
+            image = page.render(scale=RENDER_DPI / 72).to_pil()
+            page.close()
+            lines = pdf_text.tesseract_lines(image, [], tmp_dir, None,
+                                             tag=f"probe{i}")
+        except Exception:
+            return None            # 판정 실패는 판정 없음으로 — 변환을 막지 않는다
+        seen = set(_AGREE_TOKEN.findall(" ".join(l["text"] for l in lines)))
+        if len(seen) < EMBED_PROBE_MIN_TOKENS:
+            continue
+        vals.append(len(src & seen) / len(src))
+    return statistics.median(vals) if len(vals) >= 3 else None
+
+
+def clean_column_bands(regions: list[dict], page_w: int) -> dict[int, tuple[float, float]]:
+    """칼럼별 x 범위 — 단, 제 칼럼 중앙값에서 크게 벗어난 영역은 빼고 구한다.
+
+    레이아웃 모델이 오른쪽 단의 문단에 왼쪽 칼럼 번호를 붙이는 일이 있다.
+    그 한 영역 때문에 밴드가 페이지를 뒤덮으면 거터가 사라져 읽기 순서가
+    행 단위로 무너진다. 판정 기준은 pdf_text.detect_columns와 같은 값을 쓴다.
+    """
+    import statistics
+
+    cols: dict[int, list[dict]] = {}
+    for r in regions:
+        c = r.get("col", 1)
+        if c >= 1:
+            cols.setdefault(c, []).append(r)
+    bands: dict[int, tuple[float, float]] = {}
+    for c, rs in cols.items():
+        med = statistics.median((r["x0"] + r["x1"]) / 2 for r in rs)
+        keep = [r for r in rs
+                if abs((r["x0"] + r["x1"]) / 2 - med)
+                <= pdf_text.COL_OUTLIER_RATIO * page_w] or rs
+        bands[c] = (min(r["x0"] for r in keep), max(r["x1"] for r in keep))
+    return bands
+
+
 def infer_column(cx: float, bands: dict[int, tuple[float, float]]) -> int:
     """중심 x좌표가 속하는 칼럼 번호를 추정한다(레이아웃에 없는 수식용)."""
     if not bands:
@@ -642,7 +723,11 @@ def order_flow(flow: list[dict], layout_texts: list[dict], page_w: int) -> list[
     진짜 2단 페이지는 전폭 블록이 없어 기존(칼럼→y) 순서가 그대로 유지되고,
     단일 칼럼 페이지는 거터가 없어 순수 위→아래가 된다.
     """
-    bands = sorted(column_bands(layout_texts).values())
+    # 밴드는 '제 칼럼에서 멀리 떨어진 오라벨 영역'을 뺀 뒤 구한다 — 그러지 않으면
+    # 오른쪽 문단 하나에 왼쪽 칼럼 번호가 붙은 것만으로 밴드가 페이지를 뒤덮어
+    # 거터가 사라지고, 2단 페이지가 행 단위 좌→우로 읽혀 좌·우 문제가 번갈아
+    # 나온다(실측 전자회로 p293: 5.48→5.52→5.49→5.53 순).
+    bands = sorted(clean_column_bands(layout_texts, page_w).values())
     gutter = None
     if len(bands) == 2 and bands[1][0] - bands[0][1] > -0.05 * page_w:
         gutter = (bands[0][1] + bands[1][0]) / 2
@@ -1353,6 +1438,12 @@ _PAGE_NO_TOKEN = re.compile(r"(?<![\d.])(\d{1,4})(?![\d.])")
 # 무조건 지우면 '392 16장'이 '39216장'이 되어 쪽번호가 사라진다(실측).
 _SPACED_DIGITS = re.compile(r"(?<!\d)\d(?: \d)+(?!\d)")
 PAGE_NO_DRIFT = 60          # PDF 쪽과 이만큼 넘게 벌어지면 쪽번호가 아니다
+# 쪽번호를 찾을 상단 띠. 좁은 것을 먼저 보고, 못 찾을 때만 넓힌다 — 한 값으로는
+# 안 된다(실측 12쪽 표본): 7.2%는 응용수학을 12/12 맞히지만 전자기학은 1/12뿐이고,
+# 11%로 넓히면 전자기학이 11/12(오프셋 전부 일치)로 뛰는 대신 응용수학이 3/12로
+# 무너진다 — 넓은 띠가 본문 숫자를 함께 물어 오기 때문이다. 순차 폴백은 좁은 띠가
+# 이미 찾은 답을 절대 잃지 않고, 못 찾은 쪽에서만 넓은 띠를 시도한다.
+HEADER_PROBE_RATIOS = (0.072, 0.11)
 
 
 def printed_page_number(header_text: str, page_no: int) -> int | None:
@@ -1389,19 +1480,23 @@ def read_printed_page(page, page_image, tmp_dir: Path, page_no: int) -> int | No
     않는다(실측: 응용수학·전기회로는 header_band 안에 줄이 0개였다).
     내장 텍스트층을 먼저 보고, 비어 있으면 띠만 한 줄 OCR한다.
     """
-    try:
-        h, w = page.get_height(), page.get_width()
-        tp = page.get_textpage()
-        band = tp.get_text_bounded(left=0, bottom=h * (1 - HEADER_BAND_RATIO),
-                                   right=w, top=h)
-    except Exception:
-        band = ""
-    n = printed_page_number(band, page_no)
-    if n is not None:
-        return n
-    return printed_page_number(
-        pdf_text.ocr_top_band(page_image, tmp_dir, str(page_no),
-                              HEADER_BAND_RATIO), page_no)
+    for i, ratio in enumerate(HEADER_PROBE_RATIOS):
+        try:
+            h, w = page.get_height(), page.get_width()
+            tp = page.get_textpage()
+            band = tp.get_text_bounded(left=0, bottom=h * (1 - ratio),
+                                       right=w, top=h)
+            tp.close()
+        except Exception:
+            band = ""
+        n = printed_page_number(band, page_no)
+        if n is None:
+            n = printed_page_number(
+                pdf_text.ocr_top_band(page_image, tmp_dir, f"{page_no}_{i}",
+                                      ratio), page_no)
+        if n is not None:
+            return n
+    return None
 
 
 def process_page(page, page_image, images_dir: Path, page_no: int,
@@ -1908,6 +2003,15 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
             if force_scan:
                 print("  [본문] 내장 텍스트 레이어를 신뢰하지 않고 스캔 경로로 강제합니다"
                       " (force_scan)")
+            else:
+                agree = embedded_layer_agreement(pdf, tmp_dir)
+                if agree is not None:
+                    print(f"  [본문] 내장 텍스트 레이어 신뢰도 {agree * 100:.0f}%"
+                          f" (기준 {EMBED_MIN_AGREE * 100:.0f}%)")
+                    if agree < EMBED_MIN_AGREE:
+                        force_scan = True
+                        print("         낮아서 스캔 경로로 전환합니다"
+                              " — 출판사 선행 OCR이 망가진 책입니다.")
             # 선행 파이프라인: 다음 페이지의 레이아웃+수식검출을 현재 페이지의
             # 인식 작업과 겹친다. 렌더링만 메인 스레드(pdfium 제약).
             next_image = None

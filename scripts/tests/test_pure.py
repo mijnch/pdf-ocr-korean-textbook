@@ -334,6 +334,29 @@ check("prose english box", pdf_ocr.looks_like_prose(
     "a node equation at the output and solving for the resulting ratio between "
     "output voltage and input voltage across the passive elements."))
 
+# ─── detect_columns: 오라벨 영역이 거터를 지우는 것 차단 (전자회로 p293 고정) ───
+def _reg(x0, x1, col, y0=0):
+    return {"x0": x0, "x1": x1, "y0": y0, "y1": y0 + 100, "col": col}
+
+
+# 깨끗한 2단은 그대로 잡는다
+_two_col = ([_reg(230, 850, 1, y) for y in (200, 700, 1200, 1700)]
+            + [_reg(860, 1460, 2, y) for y in (200, 700, 1200, 1700)])
+check("cols clean two", pdf_text.detect_columns(_two_col, 1592) is not None)
+# 오른쪽 문단 하나가 col1로 잘못 라벨돼도 2단 판정이 살아남는다(실측 p293)
+_mislabel = _two_col + [_reg(832, 1461, 1, 550)]
+_b = pdf_text.detect_columns(_mislabel, 1592)
+check("cols survive mislabel", _b is not None and len(_b) == 2)
+# 밴드 경계가 맞닿아 어떤 글도 두 밴드 밖으로 새지 않는다
+check("cols bands contiguous", _b is not None and abs(_b[0][1] - _b[1][0]) < 1e-6)
+check("cols bands cover all", _b is not None and _b[0][0] <= 230 and _b[1][1] >= 1461)
+# 단일 칼럼은 여전히 단일로 둔다
+check("cols single stays none",
+      pdf_text.detect_columns([_reg(300, 1450, 1, y) for y in (200, 700, 1200)], 1592) is None)
+# 한 칼럼이 오라벨을 걸러내고 나서 2개 미만이면 판정을 포기한다
+check("cols thin col none",
+      pdf_text.detect_columns(_two_col[:4] + [_reg(860, 1460, 2, 200)], 1592) is None)
+
 # ─── tinted_ratio: 옅은 색 상자와 흰 바탕 도표 가르기 (실측값 고정) ───
 from PIL import Image as _PILImage  # noqa: E402
 
