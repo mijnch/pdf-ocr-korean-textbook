@@ -655,10 +655,12 @@ check("parse skip noname", all(n for n in _prof))
 # 설치하자마자 "도구가 깨졌다"는 잘못된 인상을 준다. 파일 없이도 도구는
 # 정상 동작한다(pdf_chapters 가 장 헤딩만 빼고 진행한다).
 if pdf_chapters.PROFILE_PATH.is_file():
-    _ch = pdf_chapters.for_book("대학물리 교재")
-    check("chapters loaded", len(_ch) >= 1
-          and all(isinstance(p, int) and p >= 1 and t.strip() for p, t in _ch.items()))
-    check("chapters force_scan flag", pdf_chapters.force_scan("전기회로이론") is True)
+    # 책 이름은 사용자가 파일을 바꿀 때마다 달라지므로 못 박지 않고 구조만 본다
+    _all = pdf_chapters._PROFILES
+    check("chapters loaded", len(_all) >= 1 and all(
+        isinstance(p, int) and p >= 1 and t.strip() for ch in _all.values() for p, t in ch.items()))
+    check("chapters force_scan flag",
+          all(pdf_chapters.force_scan(n) for n in pdf_chapters._FORCE_SCAN))
 else:
     print(f"  [건너뜀] 장구분.toml 이 없어 실데이터 2건을 건너뜁니다 "
           f"({pdf_chapters.PROFILE_PATH.name} 은 개인 설정이라 배포되지 않습니다)")

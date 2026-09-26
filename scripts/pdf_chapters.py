@@ -115,7 +115,8 @@ def check_anchors(md_text: str, chapters: dict[int, str]) -> list[str]:
             continue
         problems.append(f"{title} ({anchor}쪽): "
                         + (f"실제로는 {', '.join(map(str, hits))}쪽에 있음" if hits
-                           else f"앞뒤 {ANCHOR_WINDOW}쪽 안에서 못 찾음"))
+                           else f"앞뒤 {ANCHOR_WINDOW}쪽 본문에서 제목을 못 찾음"
+                                " (장 표지 사진 속 제목이면 정상 — 그 쪽 PNG로 확인)"))
     return problems
 
 
