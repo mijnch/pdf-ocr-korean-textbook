@@ -810,11 +810,16 @@ check("region clipped", pdf_ocr.colored_ratio(
 
 # ─── 장 번호를 쪽번호로 읽은 값: 여러 쪽에 되풀이되면 버린다(Floyd 실측) ───
 _rep = [(p, 1) for p in (16, 19, 20, 21, 24, 25, 26, 28)] + [(23, 3), (34, 7), (65, 12)]
-check("repeat dropped", pdf_ocr.drop_repeated_page_numbers(_rep) == [(23, 3), (34, 7), (65, 12)])
-check("repeat none survive", pdf_ocr.fill_page_numbers(pdf_ocr.rising_page_numbers(
-    pdf_ocr.confirm_page_numbers(pdf_ocr.drop_repeated_page_numbers(_rep)))) == [])
-check("repeat keeps normal", pdf_ocr.drop_repeated_page_numbers([(10, 5), (11, 6), (12, 6)])
+check("repeat split", pdf_ocr.split_repeated_page_numbers(_rep)[0] == [(23, 3), (34, 7), (65, 12)])
+check("repeat none survive", pdf_ocr.settle_pairs(_rep) == [])
+check("repeat keeps normal", pdf_ocr.split_repeated_page_numbers([(10, 5), (11, 6), (12, 6)])[0]
       == [(10, 5), (11, 6), (12, 6)])      # 두 번까지는 오독일 수 있어 남긴다
+# 1장 첫 쪽의 진짜 '1'은 목차·장 표지의 '1'과 함께 되풀이 값이 된다 — 확정된
+# 이웃과 오프셋이 맞으면 되살린다(실측 응용수학 PDF 16쪽 '1', 17쪽 '2')
+_ch1 = [(5, 1), (9, 1), (16, 1), (17, 2)] + [(p, p - 15) for p in range(18, 30)]
+_got = dict(pdf_ocr.settle_pairs(_ch1))
+check("repeat real one kept", _got.get(16) == 1 and _got.get(17) == 2)
+check("repeat false ones dropped", 5 not in _got and 9 not in _got)
 
 # ─── 인쇄 쪽번호 확정: 쪽 절이 하나도 없는 파일(반환 형식 결함 고정) ───
 with tempfile.TemporaryDirectory() as td:

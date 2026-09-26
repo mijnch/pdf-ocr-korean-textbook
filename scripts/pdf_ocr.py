@@ -1266,18 +1266,49 @@ PAGE_NO_FILL_GAP = 20    # 오프셋이 같은 두 확정값 사이가 이 폭 �
 PAGE_NO_MAX_REPEAT = 3   # 같은 인쇄 번호가 이만큼의 쪽에 나오면 쪽번호가 아니다
 
 
-def drop_repeated_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """여러 쪽에 되풀이되는 인쇄 번호를 버린다 — 쪽번호는 쪽마다 하나뿐이다.
+def split_repeated_page_numbers(pairs: list[tuple[int, int]]):
+    """(쪽마다 하나뿐인 값, 여러 쪽에 되풀이되는 값)으로 가른다.
 
     장 번호를 쪽번호로 읽으면 그 장의 모든 쪽이 같은 값('1')을 받는다. 그러면
-    오프셋이 한 칸씩 늘어나는 값들이 서로의 이웃 검증을 통과시켜 준다 — 실측
+    오프셋이 한 칸씩 늘어나는 그 값들이 서로의 이웃 검증을 통과시켜 준다 — 실측
     Floyd(쪽번호가 인쇄되지 않은 판본)에서 1장 내내 '인쇄 1쪽'이 붙었고, 이웃
-    대조 뒤에도 틀린 값 4개가 남았다. 되풀이되는 값을 먼저 빼면 남지 않는다.
+    대조 뒤에도 틀린 값 4개가 남았다. 그래서 되풀이 값은 이웃 대조에서 빼 둔다.
     """
     from collections import Counter
 
     seen = Counter(n for _p, n in pairs)
-    return [(p, n) for p, n in pairs if seen[n] < PAGE_NO_MAX_REPEAT]
+    return ([(p, n) for p, n in pairs if seen[n] < PAGE_NO_MAX_REPEAT],
+            [(p, n) for p, n in pairs if seen[n] >= PAGE_NO_MAX_REPEAT])
+
+
+def agreeing_page_numbers(cands: list[tuple[int, int]],
+                          anchors: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """후보 중 그 자리의 확정된 이웃(anchors) 오프셋과 맞는 것만 돌려준다.
+
+    되풀이 값에도 진짜가 하나 섞여 있다 — 1장 첫 쪽의 '1'은 목차·장 표지에서도
+    '1'을 읽는 바람에 되풀이 값이 된다(실측 응용수학 PDF 16쪽 '1', 17쪽 '2').
+    확정된 이웃과 오프셋이 맞으면 되살린다. 이웃이 없으면(Floyd) 되살지 않는다.
+    """
+    offs = dict((p, p - n) for p, n in anchors)
+    out = []
+    for p, n in cands:
+        near = sorted(o for q, o in offs.items() if abs(q - p) <= PAGE_NO_WINDOW)
+        if (len(near) >= PAGE_NO_MIN_VOTES
+                and abs((p - n) - near[len(near) // 2]) <= PAGE_NO_TOL):
+            out.append((p, n))
+    return out
+
+
+def settle_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """(PDF쪽, 인쇄쪽) 후보를 확정한다 — settle_page_numbers의 순수한 몸통.
+
+    유일한 값끼리 이웃 대조 → 되풀이 값은 확정된 이웃과 맞을 때만 되살림 →
+    증가하는 최장 부분열 → 두 앵커가 증명하는 빈칸 채우기.
+    """
+    unique, repeated = split_repeated_page_numbers(pairs)
+    base = confirm_page_numbers(unique)
+    return fill_page_numbers(rising_page_numbers(
+        base + agreeing_page_numbers(repeated, base)))
 
 
 def confirm_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -1377,8 +1408,7 @@ def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
     if not hits:
         return 0, 0, 0
     have = [(p, n) for p, n, _s in hits if n is not None]
-    final = dict(fill_page_numbers(rising_page_numbers(confirm_page_numbers(
-        drop_repeated_page_numbers(have)))))
+    final = dict(settle_pairs(have))
     dropped = added = fixed = 0
     out, last = [], 0
     for pdf, old, (s, e) in hits:
