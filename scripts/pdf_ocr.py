@@ -1263,6 +1263,21 @@ PAGE_NO_WINDOW = 10      # 이웃 판정 창(앞뒤 쪽 수)
 PAGE_NO_MIN_VOTES = 3    # 창 안에 이만큼 있어야 판정한다
 PAGE_NO_TOL = 1          # 이웃 중앙값과 이만큼 넘게 어긋나면 오탐
 PAGE_NO_FILL_GAP = 20    # 오프셋이 같은 두 확정값 사이가 이 폭 이하면 메운다
+PAGE_NO_MAX_REPEAT = 3   # 같은 인쇄 번호가 이만큼의 쪽에 나오면 쪽번호가 아니다
+
+
+def drop_repeated_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """여러 쪽에 되풀이되는 인쇄 번호를 버린다 — 쪽번호는 쪽마다 하나뿐이다.
+
+    장 번호를 쪽번호로 읽으면 그 장의 모든 쪽이 같은 값('1')을 받는다. 그러면
+    오프셋이 한 칸씩 늘어나는 값들이 서로의 이웃 검증을 통과시켜 준다 — 실측
+    Floyd(쪽번호가 인쇄되지 않은 판본)에서 1장 내내 '인쇄 1쪽'이 붙었고, 이웃
+    대조 뒤에도 틀린 값 4개가 남았다. 되풀이되는 값을 먼저 빼면 남지 않는다.
+    """
+    from collections import Counter
+
+    seen = Counter(n for _p, n in pairs)
+    return [(p, n) for p, n in pairs if seen[n] < PAGE_NO_MAX_REPEAT]
 
 
 def confirm_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -1362,7 +1377,8 @@ def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
     if not hits:
         return 0, 0, 0
     have = [(p, n) for p, n, _s in hits if n is not None]
-    final = dict(fill_page_numbers(rising_page_numbers(confirm_page_numbers(have))))
+    final = dict(fill_page_numbers(rising_page_numbers(confirm_page_numbers(
+        drop_repeated_page_numbers(have)))))
     dropped = added = fixed = 0
     out, last = [], 0
     for pdf, old, (s, e) in hits:

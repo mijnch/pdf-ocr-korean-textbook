@@ -808,6 +808,14 @@ check("region off-page",  # 텍스트층 좌표가 쪽 밖 수만 픽셀로 튄 
 check("region clipped", pdf_ocr.colored_ratio(
     _PILImage.new("RGB", (100, 100), (200, 30, 30)), {"x0": 50, "y0": 50, "x1": 900, "y1": 900}) == 1.0)
 
+# ─── 장 번호를 쪽번호로 읽은 값: 여러 쪽에 되풀이되면 버린다(Floyd 실측) ───
+_rep = [(p, 1) for p in (16, 19, 20, 21, 24, 25, 26, 28)] + [(23, 3), (34, 7), (65, 12)]
+check("repeat dropped", pdf_ocr.drop_repeated_page_numbers(_rep) == [(23, 3), (34, 7), (65, 12)])
+check("repeat none survive", pdf_ocr.fill_page_numbers(pdf_ocr.rising_page_numbers(
+    pdf_ocr.confirm_page_numbers(pdf_ocr.drop_repeated_page_numbers(_rep)))) == [])
+check("repeat keeps normal", pdf_ocr.drop_repeated_page_numbers([(10, 5), (11, 6), (12, 6)])
+      == [(10, 5), (11, 6), (12, 6)])      # 두 번까지는 오독일 수 있어 남긴다
+
 # ─── 인쇄 쪽번호 확정: 쪽 절이 하나도 없는 파일(반환 형식 결함 고정) ───
 with tempfile.TemporaryDirectory() as td:
     _f = Path(td) / "x.md"
