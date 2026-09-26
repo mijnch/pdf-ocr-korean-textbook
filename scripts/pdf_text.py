@@ -47,6 +47,7 @@ _WORDISH = re.compile(r"[가-힣A-Za-z]")
 _MATH_SPAN = re.compile(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)")
 # 단어 사이에 낀 외톨이 세로줄/역슬래시 노이즈("abc | def" → "abc def"). 수식 밖에서만.
 _BAR_NOISE = re.compile(r"\s+[|\\]\s+")
+_EDGE_BAR = re.compile(r"^(?:[|\\]\s+)+|(?:\s+[|\\])+$")
 
 
 # ─── 줄바꿈 이음 ───
@@ -238,8 +239,10 @@ def clean_text(text: str) -> str:
         last = m.end()
     parts.append(_BAR_NOISE.sub(" ", text[last:]))
     text = "".join(parts)
-    # 중복 공백 정리
-    return re.sub(r"\s{2,}", " ", text).strip()
+    # 중복 공백 정리 + 글 앞뒤에 외톨이로 붙은 세로줄(스캔 테두리 잡음) 제거 — 문단이
+    # '| '로 시작하면 Markdown 표 줄처럼 보여, 감사가 본문을 건너뛰어 멀쩡한 쪽을
+    # '본문이 비어 있다'고 오판했다(실측 전자기학 p10, 스캔본 5권 약 170줄).
+    return _EDGE_BAR.sub("", re.sub(r"\s{2,}", " ", text).strip())
 
 
 # 스캔 앱 워터마크(Goodnotes 한정 — 설명서에 명시) 토큰. 전면 OCR 줄과

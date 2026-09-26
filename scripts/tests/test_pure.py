@@ -708,6 +708,9 @@ check("ct outside bar clean", ct("abc | def") == "abc def")       # 수식 밖�
 check("ct mixed", ct("앞 | $a | b$ 뒤 | 끝") == "앞 $a | b$ 뒤 끝")
 check("ct noise empty", ct("| | |") == "")
 check("ct spaces", ct("본문   여러   공백") == "본문 여러 공백")
+check("ct edge bar", ct("| 길이가 0.43인 선로") == "길이가 0.43인 선로")   # 표 줄로 오인되던 잡음
+check("ct edge bar tail", ct("선로이다 |") == "선로이다")
+check("ct edge bar math keep", ct("$|x|$ 는 절댓값") == "$|x|$ 는 절댓값")
 
 # ─── parse_pages: 페이지 지정 파싱(스플라이스 순수 함수) ───
 check("pages single", pdf_splice.parse_pages(["5"]) == [5])
