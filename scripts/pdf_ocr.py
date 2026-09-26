@@ -11,17 +11,20 @@
   - 머리말/쪽번호/워터마크 → 버림. 단, 하단의 * † ‡ 각주는 본문으로 보존
 
 본문 출처는 페이지마다 자동 선택한다:
-  - 내장 텍스트 레이어가 있으면 그대로 활용(정확하고 빠름). 단, 깨지기 마련인
-    수식 부분은 버리고 새로 인식한 LaTeX로 채운다.
-  - 없으면(순수 스캔본) Tesseract로 본문을 인식한다.
+  - 내장 텍스트 레이어가 있고 책 표본에서 믿을 만하면(embedded_layer_agreement)
+    그대로 활용한다. 단, 깨지기 마련인 수식 부분은 버리고 새로 인식한 LaTeX로 채운다.
+  - 아니면 Tesseract로 인식한다 — 두 분할 모드 × 두 해상도의 판독을 줄마다
+    투표로 고르고(vote_lines), 원본이 300dpi 미만이면 키워서 읽는다.
+  - 줄 끝에서 잘린 한글 낱말은 책이 다 모인 뒤 그 책의 표기로 잇는다(resolve_joins).
   - 본문 속 '$'는 \\$로 이스케이프한다 — 삽입되는 수식 구분자 $와 짝을 이뤄
     본문이 수식으로 렌더링되는 것을 막는다(스캔본에서는 대부분 오인식 잡음).
 
 성능:
   - 모델(레이아웃/수식)은 전체 실행에서 1회만 로드해 재사용한다.
-  - Tesseract(외부 프로세스)와 다음 페이지의 레이아웃·수식검출은 현재 페이지의
-    수식 인식(MFR)과 겹쳐 실행된다(_TESS_POOL/_PREFETCH_POOL). 페이지 최대 병목은
-    책 종류에 따라 다르다(실측): 내장 텍스트본은 MFR, 스캔본은 Tesseract(~90%).
+  - 쪽들은 겹쳐 흐른다: 메인 스레드가 다음 쪽을 렌더링하고(pdfium 제약,
+    prepare_page), 선행 스레드가 그 쪽의 레이아웃·수식 검출을 한 뒤 Tesseract를
+    띄운다(precompute_page) — 이번 쪽의 수식 인식(MFR)과 동시에 돈다. 페이지 최대
+    병목은 책 종류에 따라 다르다(실측): 내장 텍스트본은 MFR, 스캔본은 Tesseract.
   - 스캔 원본이 기준 해상도(200dpi)보다 높은 페이지는 원본 해상도로 한 번 더
     렌더링해 OCR 입력·수식 크롭·그림 저장에 쓴다(좌표 공간은 200dpi로 통일).
   - 결과는 페이지마다 즉시 파일에 기록한다(중단 안전).
@@ -40,6 +43,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import pdf_audit
 import pdf_chapters
 import pdf_table
 import tuning
@@ -54,6 +58,7 @@ from pdf_text import (  # noqa: F401
     HIRES_MAX_DPI,
     MASK_MARGIN,
     MIN_LINE_CONF,
+    OCR_MIN_DPI,
     PSM_CANDIDATES,
     RENDER_DPI,
     RESCUE_MIN_CONF,
@@ -64,6 +69,7 @@ from pdf_text import (  # noqa: F401
     _MATH_SPAN,
     _WATERMARK_RE,
     _WORDISH,
+    JOIN,
     clean_text,
     detect_columns,
     detect_rotation,
@@ -73,8 +79,11 @@ from pdf_text import (  # noqa: F401
     native_scan_dpi,
     ocr_region_lines,
     ocr_region_text,
+    join_lines,
+    resolve_joins,
     start_tesseract,
     tesseract_lines,
+    vote_lines,
 )
 
 from common import (
@@ -103,14 +112,13 @@ HEADER_MAX_CHARS = 60
 HEADER_EXT_RATIO = tuning.get("layout", "header_ext_ratio")        # 확장 띠(내용 병행)
 FOOT_BAND_RATIO = tuning.get("layout", "foot_band_ratio")          # 내장책 쪽번호 띠
 CAPTION_MAX_CHARS = tuning.get("layout", "caption_max_chars")      # 캡션 최대 길이
-# Tesseract를 MFR과 겹쳐 돌리는 전용 스레드 풀. 워커 2 — 고해상 페이지의 두
-# Tesseract 패스(400dpi 주 + 200dpi 보충)는 서로 의존이 없는데 워커 1이면 직렬로
-# 돈다(검토단 4 지적: 스캔본 wall의 ~90%가 Tesseract). 실측 A/B(공학수학1 5쪽,
-# 워밍업 제외): 10.66→8.95초/쪽, wall 16% 절감, 한글 3000 동일(정확도 손실 0).
-# 두 패스가 MFR·프리페치와 코어를 나눠 써 이론상한(~37%)보다 낮지만 공짜 이득이다.
-# 외부 프로세스라 GIL 무관, 두 패스는 이미지 복사본·temp 파일명(page/band vs
-# pager/bandr)이 달라 충돌하지 않는다. 다음 페이지 선계산은 별도 풀이 담당한다.
-_TESS_POOL = ThreadPoolExecutor(max_workers=2)
+# Tesseract를 MFR과 겹쳐 돌리는 전용 스레드 풀. 고해상 페이지의 두 Tesseract
+# 패스(400dpi 주 + 200dpi 보충)는 서로 의존이 없어 함께 돈다 — 실측 A/B(공학수학1
+# 5쪽): 워커 1→2에서 10.66→8.95초/쪽, 정확도 손실 0. 여기에 다음 쪽의 두 패스가
+# 선행 스레드에서 미리 올라오므로(precompute_page) 두 쪽 몫인 4를 둔다.
+# 외부 프로세스라 GIL 무관, 작업마다 temp 파일명(p{쪽}/p{쪽}r)이 달라 충돌하지 않는다.
+TESS_WORKERS = 4
+_TESS_POOL = ThreadPoolExecutor(max_workers=TESS_WORKERS)
 # 다음 페이지의 레이아웃+수식검출을 현재 페이지 MFR과 겹치는 선행 스레드
 _PREFETCH_POOL = ThreadPoolExecutor(max_workers=1)
 
@@ -310,7 +318,7 @@ def char_font_sizes(textpage, n: int) -> list[float]:
         return []
 
 
-def _page_char_index(textpage, s_pt: float, page_h_pt: float):
+def _page_char_index(textpage):
     """페이지 전체 글자를 (글자, 글꼴, x0pt, x1pt, ypt)로 한 번만 색인한다.
 
     표 셀마다 다시 훑지 않도록 페이지당 1회만 만든다(글자 ~1.5천개 수준).
@@ -463,9 +471,6 @@ _FOOTNOTE_RE = re.compile(r"^\s*[*＊†‡]")
 _TABLE_CAP_RE = re.compile(r"^표\s*\d")
 
 
-
-
-
 # ─────────────────────────── 영역 분류 ───────────────────────────
 
 CALLOUT_COLOR_RATIO = tuning.get("layout", "callout_color_ratio")  # 색 박스 판정
@@ -475,19 +480,27 @@ _CALLOUT_JUNK = re.compile(r"[A-Za-z0-9]{3,}")
 CALLOUT_REDO_GAIN = 1.15   # 크롭 재인식이 이만큼 더 많이 읽어야 교체한다
 
 
+def _region_pixels(page_image, region: dict, size: int) -> list:
+    """영역을 size×size로 줄인 RGB 픽셀 목록. 한 픽셀도 안 되는 영역이면 빈 목록.
+
+    고해상 판독의 좌표를 기준 공간으로 나누면 1픽셀 미만 높이의 줄 상자가 생긴다
+    (실측 전자기학 p176) — 그대로 줄이면 PIL이 예외를 내 쪽 전체가 실패한다.
+    """
+    crop = page_image.crop((round(region["x0"]), round(region["y0"]),
+                            round(region["x1"]), round(region["y1"])))
+    if crop.width < 1 or crop.height < 1:
+        return []
+    return list(crop.convert("RGB").resize((size, size)).getdata())
+
+
 def colored_ratio(page_image, region: dict) -> float:
     """영역 배경의 유색(채도 있는) 픽셀 비율. 흰/검/회색이면 0에 가깝다.
 
     색칠된 강조·예제 박스(콜아웃)를 일반 본문과 구분하는 데 쓴다.
     """
-    crop = page_image.crop(
-        (region["x0"], region["y0"], region["x1"], region["y1"])
-    ).convert("RGB").resize((40, 40))
-    pix = list(crop.getdata())
+    pix = _region_pixels(page_image, region, 40)
     colored = sum(1 for r, g, b in pix if max(r, g, b) - min(r, g, b) > 40)
     return colored / len(pix) if pix else 0.0
-
-
 
 
 def tinted_ratio(page_image, region: dict) -> float:
@@ -497,10 +510,7 @@ def tinted_ratio(page_image, region: dict) -> float:
     옅은 하늘색인 경우가 많아 그 문턱을 넘지 못한다(전자회로 p500 상자:
     채도 기준 3.2%, 이 기준 59.9%). 흰 바탕의 도표는 0~5%다(실측).
     """
-    crop = page_image.crop(
-        (region["x0"], region["y0"], region["x1"], region["y1"])
-    ).convert("RGB").resize((48, 48))
-    pix = list(crop.getdata())
+    pix = _region_pixels(page_image, region, 48)
     tint = sum(1 for r, g, b in pix
                if min(r, g, b) > 170 and max(r, g, b) - min(r, g, b) > 6)
     return tint / len(pix) if pix else 0.0
@@ -576,20 +586,6 @@ def is_caption_like(text: str) -> bool:
     return len(t) <= CAPTION_MAX_CHARS
 
 
-def column_bands(regions: list[dict]) -> dict[int, tuple[float, float]]:
-    """칼럼 번호별 x 범위(중심 추정용)를 구한다. {col: (x0, x1)}."""
-    bands: dict[int, tuple[float, float]] = {}
-    for r in regions:
-        c = r.get("col", 1)
-        if c < 1:
-            continue
-        if c in bands:
-            bands[c] = (min(bands[c][0], r["x0"]), max(bands[c][1], r["x1"]))
-        else:
-            bands[c] = (r["x0"], r["x1"])
-    return bands
-
-
 _AGREE_TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z]{3,}")
 EMBED_MIN_AGREE = 0.75   # 내장층 토큰이 Tesseract 판독과 이만큼은 겹쳐야 신뢰한다
 EMBED_PROBE_PAGES = 12   # 판정에 쓰는 표본 쪽 수
@@ -622,10 +618,9 @@ def embedded_layer_agreement(pdf, tmp_dir: Path,
         return None
     step = max(1, int(n * 0.6) // sample)
     vals: list[float] = []
-    for k, i in enumerate(range(int(n * 0.2), int(n * 0.8), step)):
-        if k >= sample:
-            break
-        try:
+    jobs = []   # 렌더링은 메인 스레드에서, 표본 쪽들의 Tesseract는 한꺼번에 돌린다
+    try:
+        for i in list(range(int(n * 0.2), int(n * 0.8), step))[:sample]:
             page = pdf[i]
             tp = page.get_textpage()
             raw = tp.get_text_bounded()
@@ -636,14 +631,15 @@ def embedded_layer_agreement(pdf, tmp_dir: Path,
                 continue
             image = page.render(scale=RENDER_DPI / 72).to_pil()
             page.close()
-            lines = pdf_text.tesseract_lines(image, [], tmp_dir, None,
-                                             tag=f"probe{i}")
-        except Exception:
-            return None            # 판정 실패는 판정 없음으로 — 변환을 막지 않는다
-        seen = set(_AGREE_TOKEN.findall(" ".join(l["text"] for l in lines)))
-        if len(seen) < EMBED_PROBE_MIN_TOKENS:
-            continue
-        vals.append(len(src & seen) / len(src))
+            jobs.append((src, _TESS_POOL.submit(pdf_text.tesseract_lines, image, [],
+                                                tmp_dir, None, tag=f"probe{i}")))
+        for src, fut in jobs:
+            lines = fut.result()
+            seen = set(_AGREE_TOKEN.findall(" ".join(l["text"] for l in lines)))
+            if len(seen) >= EMBED_PROBE_MIN_TOKENS:
+                vals.append(len(src & seen) / len(src))
+    except Exception:
+        return None            # 판정 실패는 판정 없음으로 — 변환을 막지 않는다
     return statistics.median(vals) if len(vals) >= 3 else None
 
 
@@ -872,7 +868,7 @@ def _weave_by_words(text: str, words: list, formulas: list[dict]) -> str | None:
     if not words:
         return None
     total = sum(n for n, _a, _b in words)
-    stripped = re.sub(r"\s+", "", text)
+    stripped = _squash(text)
     if total <= 0 or not stripped:
         return None
     cuts: list[tuple[int, str]] = []
@@ -983,7 +979,7 @@ def assemble_region_text(region: dict, embeddings: list[dict],
     for row in rows:
         row.sort(key=lambda it: it["x0"])
         out.append(" ".join(it["text"] for it in row))
-    return clean_text(" ".join(out))
+    return clean_text(join_lines(out))
 
 
 # ─────────────────────────── 페이지 → Markdown ───────────────────────────
@@ -1073,11 +1069,11 @@ def split_semantic_heading(text: str) -> tuple[str | None, str]:
     m = _SEM_HEAD.match(text)
     if not m:
         return None, text
-    word = re.sub(r"\s+", "", m.group(1))
-    num = re.sub(r"\s+", "", m.group(2) or "")
+    word = _squash(m.group(1))
+    num = _squash(m.group(2) or "")
     rest = text[m.end():].strip()
     # 같은 표지어가 뒤에 또 나오면 색인·목록 줄이다(헤딩 아님)
-    if re.sub(r"\s+", "", rest).count(word) >= 1:
+    if _squash(rest).count(word) >= 1:
         return None, text
     # 번호가 안 붙었는데 뒤가 숫자로 시작하면 번호 매칭이 실패한 참조 문장이다
     # ('퀴즈 7.8에서 …') — 표지로 보지 않는다.
@@ -1132,7 +1128,7 @@ def render_flow(flow: list[dict], page_w: int) -> list[str]:
                 if not rest:
                     continue
                 body = rest
-            paragraph = (paragraph + " " + body).strip() if paragraph else body
+            paragraph = join_lines([paragraph, body])
             join_limit = col_right.get(b.get("col", 1), page_w) - PARA_JOIN_MARGIN
             if b["x1"] < join_limit:  # 우측 끝에 못 미치면 문단 끝
                 flush_para()
@@ -1360,7 +1356,7 @@ def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
     hits = [(int(m.group(1)), int(m.group(2)) if m.group(2) else None, m.span())
             for m in _PAGE_HEAD_ANY.finditer(text)]
     if not hits:
-        return 0, 0
+        return 0, 0, 0
     have = [(p, n) for p, n, _s in hits if n is not None]
     final = dict(fill_page_numbers(rising_page_numbers(confirm_page_numbers(have))))
     dropped = added = fixed = 0
@@ -1384,6 +1380,19 @@ def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
     out.append(text[last:])
     md_path.write_text("".join(out), encoding="utf-8")
     return dropped, added, fixed
+
+
+def settle_line_joins(md_path: Path) -> tuple[int, int]:
+    """줄바꿈 이음 표식을 책 전체의 표기로 확정한다. 반환: (붙인 수, 띄운 수).
+
+    책이 다 모여야 증거가 가장 많으므로 파일이 완성된 뒤 한 번 돈다
+    (판정 규칙은 pdf_text.resolve_joins).
+    """
+    text = md_path.read_text(encoding="utf-8")
+    new, glued, spaced = resolve_joins(text)
+    if new != text:
+        md_path.write_text(new, encoding="utf-8")
+    return glued, spaced
 
 
 def insert_glossary(md_path: Path) -> int:
@@ -1423,6 +1432,11 @@ def _discard_output(out_path: Path, images_dir: Path) -> None:
             pass
 
 
+def _squash(text: str) -> str:
+    """공백과 줄바꿈 이음 표식을 모두 뺀다 — 같은 글인지 견줄 때 쓴다."""
+    return re.sub(rf"[\s{JOIN}]+", "", text)
+
+
 def upright_page(page_image, tmp_dir: Path, page_no: int):
     """눕거나 뒤집힌 쪽을 세워서 돌려준다(필요 없으면 원본 그대로).
 
@@ -1445,15 +1459,129 @@ def upright_page(page_image, tmp_dir: Path, page_no: int):
     return page_image.rotate(-angle, expand=True), angle
 
 
-def precompute_page(page_image):
-    """레이아웃 분석 + 수식 검출 — 선행 스레드에서 다음 페이지 몫을 미리 계산한다.
+def prepare_page(page, force_scan: bool = False) -> dict:
+    """쪽 하나의 입력을 메인 스레드에서 마련한다(pdfium은 스레드 불안전이다).
 
-    (렌더링은 pdfium이 스레드 불안전이라 반드시 메인 스레드에서 한다)
+      image    기준 렌더링(RENDER_DPI) — 모든 좌표가 이 공간이다.
+      hires    스캔 원본이 기준보다 높으면 원본 해상도(상한 HIRES_MAX_DPI) 렌더링.
+               수식 크롭·그림 저장·글자 인식이 원본 화질을 쓴다.
+      ocr      원본이 OCR_MIN_DPI보다 낮은 스캔 쪽을 그 해상도로 키운 렌더링 —
+               글자 인식에만 쓴다. pdfium이 원본 이미지에서 바로 키워야 한다.
+               기준 렌더링을 PIL로 다시 키우면 두 번 보간되어 이득이 절반으로
+               준다(실측 전자기학 p309 문자 일치율: 원본 87.1%, PIL 확대 89.9%,
+               pdfium 확대 92.1%).
+      embedded 내장 텍스트층으로 본문을 읽는가(force_scan이면 아니다).
+      bands    상단 머리말 띠의 내장 텍스트(인쇄 쪽번호용, HEADER_PROBE_RATIOS 순).
+    """
+    image = page.render(scale=RENDER_DPI / 72).to_pil()
+    tp = page.get_textpage()
+    try:
+        embedded = has_embedded_text(tp) and not force_scan
+        h, w = page.get_height(), page.get_width()
+        bands = []
+        for ratio in HEADER_PROBE_RATIOS:
+            try:
+                bands.append(tp.get_text_bounded(left=0, bottom=h * (1 - ratio),
+                                                 right=w, top=h))
+            except Exception:
+                bands.append("")
+    finally:
+        tp.close()
+    ndpi = min(native_scan_dpi(page), HIRES_MAX_DPI)
+    hires = page.render(scale=ndpi / 72).to_pil() if ndpi > RENDER_DPI else None
+    ocr = (page.render(scale=OCR_MIN_DPI / 72).to_pil()
+           if not embedded and ndpi < OCR_MIN_DPI else None)
+    return {"image": image, "hires": hires, "ocr": ocr,
+            "embedded": embedded, "bands": bands}
+
+
+def split_regions(regions: list[dict], page_image):
+    """레이아웃 영역을 (그림, 본문, 버림 상자, 머리말 띠 높이)로 가른다."""
+    image_regions = [r for r in regions if r["kind"] == "image"]
+    layout_texts = [r for r in regions if r["kind"] == "text"]
+    drop_boxes = [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in regions if r["kind"] == "drop"]
+    # 레이아웃이 머리말을 TEXT로 잘못 남긴 페이지의 누수 차단: 페이지 상단 띠에
+    # 완전히 들어간 텍스트 영역·본문 줄은 러닝 헤더이므로 버린다.
+    # 임계 7.2%: 5권 실측에서 머리말은 y1≤6.8%H에서 끝나고, 본문 첫 줄은
+    # (스캔북 포함) y0≥7.3%H에서 시작한다 — 양쪽 모두 여유가 있는 경계값.
+    # 다만 비율만 믿으면 상단 여백이 좁은 자료(강의 슬라이드, 여백 없는 조판)의
+    # 매 쪽 첫 줄 — 대개 장·절 제목 — 을 말없이 잘라낸다(검토단 실증). 띠 안의
+    # 글이 러닝 헤더답게 '짧을' 때만 버린다. 러닝 헤더는 쪽번호·장제목 조각이라
+    # 짧고, 본문 첫 줄은 문장이거나 제목이라 길다.
+    header_band = HEADER_BAND_RATIO * page_image.height
+    in_band = [r for r in layout_texts
+               if r["y1"] <= header_band and len(r.get("text", "")) <= HEADER_MAX_CHARS]
+    drop_boxes += [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in in_band]
+    _dropped = {id(r) for r in in_band}
+    layout_texts = [r for r in layout_texts if id(r) not in _dropped]
+    return image_regions, layout_texts, drop_boxes, header_band
+
+
+def start_text_ocr(page_image, regions: list[dict], detections, ocr_hi,
+                   tmp_dir: Path, page_no: int) -> dict:
+    """스캔 경로의 전면 인식(Tesseract)을 띄운다 — 기다리지 않는다.
+
+    pdfium을 쓰지 않으므로 선행 스레드가 다음 쪽 몫으로 부를 수 있다. 그래서
+    다음 쪽의 Tesseract가 이번 쪽의 수식 인식·마무리와 겹쳐 돈다(스캔본은
+    Tesseract가 쪽 시간의 대부분이다). 그림·수식·버림 영역은 흰색으로 가리고
+    읽는다 — 환각으로 버려질 검출 상자까지 가리지만, 그런 영역은 그림 조각·
+    잡음이라 본문이 아니다(기준 페이지 대조로 출력 동일성 검증됨).
+    하단 버림 영역은 각주일 수 있어(레이아웃이 각주·꼬리말·워터마크를 같은
+    클래스로 버림) 가리지 않고, 나중에 내용으로 판별해 각주만 살린다.
+    반환: 결과를 거둘 때 필요한 것들 — 작업(main·rescue), 채택되지 않은 판독
+    (줄 투표의 표), 칼럼, 각주 상자, 인식 배율.
+    """
+    image_regions, layout_texts, drop_boxes, _hb = split_regions(regions, page_image)
+    page_w = page_image.width
+    k = ocr_hi.width / page_w if ocr_hi is not None else 1.0
+    dpi = round(RENDER_DPI * k)
+    foot = [b for b in drop_boxes if b[1] > 0.8 * page_image.height]
+    mask = [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in image_regions]
+    mask += [(b[0], b[1], b[2], b[3]) for _, b in detections]
+    mask += [b for b in drop_boxes if b not in foot]
+    bands = detect_columns(layout_texts, page_w)  # 다단이면 칼럼별로 따로 인식
+    st = {"k": k, "dpi": dpi, "bands": bands, "foot": foot,
+          "alt_main": [], "alt_resc": [], "rescue": None}
+    if ocr_hi is None:
+        st["main"] = _TESS_POOL.submit(tesseract_lines, page_image, mask, tmp_dir,
+                                       bands, tag=f"p{page_no}")
+        return st
+    # 고해상 입력으로 인식(좌표는 결과 수신 후 환산)
+    mask_hi = [tuple(v * k for v in b) for b in mask]
+    bands_hi = [(x0 * k, x1 * k) for x0, x1 in bands] if bands else None
+    st["main"] = _TESS_POOL.submit(tesseract_lines, ocr_hi, mask_hi, tmp_dir, bands_hi,
+                                   dpi, tag=f"p{page_no}", alternates=st["alt_main"])
+    # 고해상 사각지대 구조: 400dpi에서 Tesseract가 짧은 들여쓰기 줄을 PSM 불문
+    # 놓치는 사례 실측(p567) — 기준 해상도로 한 번 더 읽어 주 결과에 없는 줄만
+    # 보충한다. 이 판독은 줄 투표의 표로도 쓴다(vote_lines).
+    st["rescue"] = _TESS_POOL.submit(tesseract_lines, page_image, mask, tmp_dir, bands,
+                                     tag=f"p{page_no}r", alternates=st["alt_resc"])
+    return st
+
+
+def precompute_page(inp: dict, tmp_dir: Path, page_no: int):
+    """쪽 하나의 선행 작업 — 레이아웃 분석 + 수식 검출, 그리고 외부 인식 띄우기.
+
+    선행 스레드에서 다음 쪽 몫으로 돈다(렌더링·텍스트층은 prepare_page가 메인
+    스레드에서 이미 마련했다). 반환: (영역, 수식 검출, 전면 인식 작업|None,
+    머리말 띠 인식 작업|None). 머리말 띠는 내장 텍스트로 쪽번호를 못 읽을 때만
+    미리 읽어 둔다 — read_printed_page가 어차피 그 순서로 읽는다.
     """
     import pdf_layout
     import pdf_math
 
-    return pdf_layout.analyze(page_image), pdf_math.find_formulas(page_image)
+    image = inp["image"]
+    regions = pdf_layout.analyze(image)
+    detections = pdf_math.find_formulas(image)
+    started = None
+    if not inp["embedded"]:
+        ocr_hi = inp["ocr"] if inp["ocr"] is not None else inp["hires"]
+        started = start_text_ocr(image, regions, detections, ocr_hi, tmp_dir, page_no)
+    header = None
+    if printed_page_number(inp["bands"][0], page_no) is None:
+        header = _TESS_POOL.submit(pdf_text.ocr_top_band, image, tmp_dir,
+                                   f"{page_no}_0", HEADER_PROBE_RATIOS[0])
+    return regions, detections, started, header
 
 
 _PROSE_HANGUL = re.compile(r"[가-힣]")
@@ -1524,70 +1652,53 @@ def printed_page_number(header_text: str, page_no: int) -> int | None:
     return best[1] if best else None
 
 
-def read_printed_page(page, page_image, tmp_dir: Path, page_no: int) -> int | None:
+def read_printed_page(bands: list[str], page_image, tmp_dir: Path, page_no: int,
+                      early=None) -> int | None:
     """상단 머리말 띠를 직접 읽어 인쇄 쪽번호를 회수한다.
 
     파이프라인의 줄 목록에 기대지 않는다 — 책에 따라 머리말이 줄로 잡히지
     않는다(실측: 응용수학·전기회로는 header_band 안에 줄이 0개였다).
-    내장 텍스트층을 먼저 보고, 비어 있으면 띠만 한 줄 OCR한다.
+    띠마다 내장 텍스트층(bands)을 먼저 보고, 못 읽으면 띠만 한 줄 OCR한다.
+    early는 첫 띠의 OCR을 선행 스레드가 미리 띄워 둔 작업이다(precompute_page).
     """
     for i, ratio in enumerate(HEADER_PROBE_RATIOS):
-        try:
-            h, w = page.get_height(), page.get_width()
-            tp = page.get_textpage()
-            band = tp.get_text_bounded(left=0, bottom=h * (1 - ratio),
-                                       right=w, top=h)
-            tp.close()
-        except Exception:
-            band = ""
-        n = printed_page_number(band, page_no)
+        n = printed_page_number(bands[i], page_no)
         if n is None:
-            n = printed_page_number(
-                pdf_text.ocr_top_band(page_image, tmp_dir, f"{page_no}_{i}",
-                                      ratio), page_no)
+            if i == 0 and early is not None:
+                try:
+                    txt = early.result()
+                except Exception:
+                    txt = ""
+            else:
+                txt = pdf_text.ocr_top_band(page_image, tmp_dir, f"{page_no}_{i}", ratio)
+            n = printed_page_number(txt, page_no)
         if n is not None:
             return n
     return None
 
 
-def process_page(page, page_image, images_dir: Path, page_no: int,
-                 tmp_dir: Path, pre=None, hires_image=None,
-                 force_scan: bool = False
-                 ) -> tuple[list[str], int, str, int | None]:
+def process_page(page, inp: dict, images_dir: Path, page_no: int,
+                 tmp_dir: Path, pre=None) -> tuple[list[str], int, str, int | None]:
     """한 페이지를 인식해 (Markdown 줄, 수식 수, 본문 출처, 인쇄 쪽번호)를 반환한다.
 
-    pre: precompute_page()가 미리 계산한 (레이아웃, 수식검출). 없으면 여기서 계산.
-    hires_image: 스캔 원본이 기준 해상도보다 높은 페이지의 원본 해상도 렌더링.
-      레이아웃·좌표 계산은 기준 해상도(page_image) 공간에서 그대로 하고,
-      Tesseract 입력·수식 크롭·그림 저장만 이 이미지를 써서 원본 화질을 살린다.
-    force_scan: 참이면 내장 텍스트 레이어가 있어도 무시하고 스캔 경로로 인식한다
-      (타 도구가 입힌 저품질 OCR층을 신뢰하지 않는 책 — 장구분.toml의 force_scan).
+    inp: prepare_page()가 메인 스레드에서 마련한 입력(렌더링·텍스트층 판정·머리말 띠).
+      레이아웃·좌표 계산은 기준 해상도(image) 공간에서 하고, Tesseract 입력·수식
+      크롭·그림 저장만 고해상(hires)을 써서 원본 화질을 살린다. 저해상 스캔을 키운
+      렌더링(ocr)은 글자 인식에만 쓴다.
+    pre: precompute_page()가 선행 스레드에서 미리 해 둔 몫(레이아웃·수식 검출·
+      띄워 둔 인식 작업). 없으면 여기서 한다.
     """
-    import pdf_layout
     import pdf_math
 
+    page_image, hires_image = inp["image"], inp["hires"]
+    embedded = inp["embedded"]
+    if pre is None:
+        pre = precompute_page(inp, tmp_dir, page_no)
+    regions, detections, started, header_ocr = pre
     page_w = page_image.width
     k = hires_image.width / page_image.width if hires_image is not None else 1.0
     hires_dpi = round(RENDER_DPI * k)
-    regions = pre[0] if pre else pdf_layout.analyze(page_image)
-    image_regions = [r for r in regions if r["kind"] == "image"]
-    layout_texts = [r for r in regions if r["kind"] == "text"]
-    drop_boxes = [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in regions if r["kind"] == "drop"]
-
-    # 레이아웃이 머리말을 TEXT로 잘못 남긴 페이지의 누수 차단: 페이지 상단 띠에
-    # 완전히 들어간 텍스트 영역·본문 줄은 러닝 헤더이므로 버린다.
-    # 임계 7.2%: 5권 실측에서 머리말은 y1≤6.8%H에서 끝나고, 본문 첫 줄은
-    # (스캔북 포함) y0≥7.3%H에서 시작한다 — 양쪽 모두 여유가 있는 경계값.
-    # 다만 비율만 믿으면 상단 여백이 좁은 자료(강의 슬라이드, 여백 없는 조판)의
-    # 매 쪽 첫 줄 — 대개 장·절 제목 — 을 말없이 잘라낸다(검토단 실증). 띠 안의
-    # 글이 러닝 헤더답게 '짧을' 때만 버린다. 러닝 헤더는 쪽번호·장제목 조각이라
-    # 짧고, 본문 첫 줄은 문장이거나 제목이라 길다.
-    header_band = HEADER_BAND_RATIO * page_image.height
-    in_band = [r for r in layout_texts
-               if r["y1"] <= header_band and len(r.get("text", "")) <= HEADER_MAX_CHARS]
-    drop_boxes += [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in in_band]
-    _dropped = {id(r) for r in in_band}
-    layout_texts = [r for r in layout_texts if id(r) not in _dropped]
+    image_regions, layout_texts, drop_boxes, header_band = split_regions(regions, page_image)
 
     # 그림 영역 내부의 글자·수식 라벨은 본문으로 새어 나오면 안 된다(이미지 PNG에 포함됨).
     # 영역 안에 중심이 들어오는 텍스트 줄·수식을 걸러내는 판정 함수.
@@ -1612,45 +1723,10 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
                    and y0 - _fig_pad_y <= cy <= y1 + _fig_pad_y
                    for x0, y0, x1, y1 in fig_boxes)
 
-    # 수식은 MFD로 검출(독립+인라인) → LaTeX 인식
-    detections = pre[1] if pre else pdf_math.find_formulas(page_image)
-
-    # 스캔 페이지: Tesseract(외부 프로세스)와 MFR(LaTeX 인식)은 겹쳐 돌린다. 스캔본은
-    # Tesseract가 페이지 시간의 ~90%로 최대 병목이므로(실측) MFR보다 먼저 비동기로
-    # 던져 MFR·다음 페이지 선계산과 최대한 겹친다. 환각으로 버려질 검출 박스까지
-    # 가리게 되지만, 그런 영역은 그림 조각·잡음이라 본문이 아니다(기준 페이지
-    # 대조로 출력 동일성 검증됨).
+    # 스캔 쪽의 Tesseract는 precompute_page가 이미 띄웠다 — 수식 인식(MFR)과
+    # 겹쳐 돈다. 스캔본은 Tesseract가 쪽 시간의 대부분이다(실측).
     textpage = page.get_textpage()
-    embedded = has_embedded_text(textpage) and not force_scan
-    tess_future = None
-    rescue_future = None
-    ocr_bands = None
-    # 하단 버림 영역은 각주일 수 있다(레이아웃이 각주·꼬리말·워터마크를 같은
-    # 클래스로 버림). 마스크에서 빼고 OCR한 뒤 내용으로 판별해 각주만 살린다.
-    foot_boxes = [b for b in drop_boxes if b[1] > 0.8 * page_image.height] \
-        if not embedded else []
-    if not embedded:
-        mask = [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in image_regions]
-        mask += [(b[0], b[1], b[2], b[3]) for _, b in detections]
-        mask += [b for b in drop_boxes if b not in foot_boxes]
-        ocr_bands = detect_columns(layout_texts, page_w)  # 다단이면 칼럼별로 따로 인식
-        if hires_image is not None:  # 고해상 입력으로 인식(좌표는 결과 수신 후 환산)
-            mask_hi = [tuple(v * k for v in b) for b in mask]
-            bands_hi = [(x0 * k, x1 * k) for x0, x1 in ocr_bands] if ocr_bands else None
-            tess_future = _TESS_POOL.submit(
-                tesseract_lines, hires_image, mask_hi, tmp_dir, bands_hi, hires_dpi,
-                tag=f"p{page_no}")
-            # 고해상 사각지대 구조: 400dpi에서 Tesseract가 짧은 들여쓰기 줄을 PSM
-            # 불문 놓치는 사례 실측(p567) — 기준 해상도로 한 번 더 읽어 주 결과에
-            # 없는 줄만 보충한다. 같은 풀(순차)이라 MFR 그늘에 함께 숨는다.
-            rescue_future = _TESS_POOL.submit(
-                tesseract_lines, page_image, mask, tmp_dir, ocr_bands,
-                tag=f"p{page_no}r")
-        else:
-            tess_future = _TESS_POOL.submit(
-                tesseract_lines, page_image, mask, tmp_dir, ocr_bands,
-                tag=f"p{page_no}")
-
+    foot_boxes = started["foot"] if started else []
     try:
         if hires_image is not None:  # 수식 크롭도 원본 해상도로
             latexes = pdf_math.recognize_latex(
@@ -1658,12 +1734,14 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
         else:
             latexes = pdf_math.recognize_latex(page_image, [box for _, box in detections])
     except Exception:
-        for fut in (tess_future, rescue_future):  # MFR 실패 시 떠 있는 Tesseract 정리
+        # MFR 실패 시 떠 있는 인식을 거둔다 — Tesseract 자체 오류가 원인(MFR 예외)을
+        # 가리지 않게 결과는 버린다.
+        for fut in ((started or {}).get("main"), (started or {}).get("rescue"), header_ocr):
             if fut is not None:
                 try:
                     fut.result()
                 except Exception:
-                    pass  # Tesseract 자체 오류가 원인(MFR 예외)을 가리지 않게 한다
+                    pass
         raise
     formulas = [
         {"kind": kind, "text": lx, "x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3]}
@@ -1673,29 +1751,35 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     n_formulas = len(formulas)
     isolated = [f for f in formulas if f["kind"] == "isolated"]
 
-    # 본문 줄 확보 (내장 텍스트 우선, 없으면 위에서 병렬 시작한 Tesseract 결과)
+    # 본문 줄 확보 (내장 텍스트 우선, 없으면 미리 띄운 Tesseract 결과)
     if embedded:
         lines, isolated = embedded_lines(page, textpage, formulas)
         weave: list[dict] = []  # 내장 경로는 줄에 인라인 수식이 이미 들어 있음
         source = "내장 텍스트"
     else:
-        lines = tess_future.result()
-        if hires_image is not None:  # 고해상 좌표 → 기준 공간으로 환산
-            for ln in lines:
+        lines = started["main"].result()
+        k_ocr, alt_main = started["k"], started["alt_main"]
+        if k_ocr != 1.0:  # 고해상 좌표 → 기준 공간으로 환산
+            for ln in lines + [l for r in alt_main for l in r]:
                 for key in ("x0", "y0", "x1", "y1"):
-                    ln[key] /= k
+                    ln[key] /= k_ocr
                 # 단어 경계도 같은 공간으로 — 보충 줄(기준 해상도)과 섞이므로 필수
                 if ln.get("words"):
-                    ln["words"] = [(n, a / k, b / k) for n, a, b in ln["words"]]
+                    ln["words"] = [(n, a / k_ocr, b / k_ocr) for n, a, b in ln["words"]]
         weave = [f for f in formulas if f["kind"] == "embedding"]  # 스캔: 인라인 수식 재삽입
+        ocr_bands = started["bands"]
         source = "Tesseract" + (f"({len(ocr_bands)}단)" if ocr_bands else "")
-        if hires_image is not None:
-            source += f"·{hires_dpi}dpi"
-        if rescue_future is not None:
+        if k_ocr != 1.0:
+            source += f"·{started['dpi']}dpi" + ("(확대)" if inp["ocr"] is not None else "")
+        if started["rescue"] is not None:
             try:  # 기준 해상도 보충 — 실패해도 주 결과에는 영향 없음(보충일 뿐)
-                resc = rescue_future.result()
+                resc = started["rescue"].result()
             except Exception:
                 resc = []
+            # 줄마다 네 판독(두 PSM × 두 해상도) 중 가장 합의된 것을 고른다
+            n_voted = vote_lines(lines, alt_main + [resc] + started["alt_resc"])
+            if n_voted:
+                source += f"·투표{n_voted}줄"
             # 레이아웃이 본문으로 보증한 영역 안의 줄만 보충한다 — 영역 밖 떠돌이
             # 줄(색 밴드의 저해상 오독 등)이 콜아웃·본문 잡음으로 새는 것을
             # 차단한다(p567 실측: 'OE wer 5288' 유입 사례).
@@ -1712,7 +1796,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     # "교재 274쪽"이라 하면 AI가 PDF 274쪽을 읽어 엉뚱한 답을 했다.
     # 단일 오프셋으로는 못 고친다: 실측 결과 오프셋이 책 안에서도 변한다
     # (대학물리 +13→+8→+4→-3, 대학수학 +8→+5). 쪽마다 새기는 수밖에 없다.
-    printed_no = read_printed_page(page, page_image, tmp_dir, page_no)
+    printed_no = read_printed_page(inp["bands"], page_image, tmp_dir, page_no, header_ocr)
 
     # 색 배경 글상자 되살리기: 교재의 예제·정리 상자는 배경에 색이 깔려 있어
     # 레이아웃 모델이 통째로 FIGURE로 잡는다. 그러면 전면 OCR 마스크가 상자
@@ -1756,7 +1840,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
             # 회로도·그래프는 그림 PNG에 그대로 있으므로 본문에 옮길 이유가 없다.
             keep = [ln for ln in sorted(rec, key=lambda l: (l["y0"], l["x0"]))
                     if len(_WORDISH.findall(ln["text"])) >= TEXTBOX_LINE_LETTERS]
-            text = clean_text(" ".join(ln["text"] for ln in keep))
+            text = clean_text(join_lines(ln["text"] for ln in keep))
             if not looks_like_prose(text, strict=_strict):
                 continue
             textbox_recovered.append({"x0": r["x0"], "y0": r["y0"], "x1": r["x1"],
@@ -1838,7 +1922,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
         # 등)을 러닝 헤더처럼 drop으로 버리는 경우가 있다. 러닝 헤더는 얇으므로(≈2%H),
         # 상단의 충분히 '큰'(>4.5%H) drop 영역만 개별 크롭으로 인식해, 페이지 어디에도
         # 없는(이미지에만 박힌) 제목이면 되살린다.
-        page_txt = re.sub(r"\s+", "", " ".join(r.get("text", "") for r in text_regions))
+        page_txt = _squash(" ".join(r.get("text", "") for r in text_regions))
         for idx, r in enumerate(regions):
             if r["kind"] != "drop":
                 continue
@@ -1850,15 +1934,15 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
             rec = ocr_region_text(base_img, box, tmp_dir, f"title{page_no}_{idx}", hires_dpi)
             if len(_WORDISH.findall(rec)) < 2 or _RUNNING_HDR.match(rec):
                 continue
-            if re.sub(r"\s+", "", rec) in page_txt:  # 이미 본문/캡션에 있으면 중복 방지
+            if _squash(rec) in page_txt:  # 이미 본문/캡션에 있으면 중복 방지
                 continue
             text_regions.append({"x0": r["x0"], "y0": r["y0"], "x1": r["x1"],
                                  "y1": r["y1"], "col": 1, "type": "TITLE", "text": rec})
-            page_txt += re.sub(r"\s+", "", rec)  # 같은 제목의 중복 복원 방지
+            page_txt += _squash(rec)  # 같은 제목의 중복 복원 방지
         # 하단 각주 되살리기: 하단 drop(각주·워터마크·쪽번호)을 개별 크롭으로 인식해,
         # 각주 마커(* † ‡)·한글(4자+)·연도범위(1803-1853) 중 하나가 있고 아직 페이지에
         # 없으면 본문으로 살린다. 워터마크('Made with…')·쪽번호는 셋 다 없어 걸러진다.
-        page_txt = re.sub(r"\s+", "", " ".join(r.get("text", "") for r in text_regions))
+        page_txt = _squash(" ".join(r.get("text", "") for r in text_regions))
         for fi, b in enumerate(foot_boxes):
             rec = ocr_region_text(base_img, tuple(v * k for v in b),
                                   tmp_dir, f"foot{page_no}_{fi}", hires_dpi)
@@ -1868,11 +1952,11 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
                     or len(re.findall(r"[가-힣]", rec)) >= 4
                     or re.search(r"\(\s*1?\d{3}\s*[-~–]\s*1?\d{3}\s*\)", rec)):
                 continue
-            if re.sub(r"\s+", "", rec) in page_txt:
+            if _squash(rec) in page_txt:
                 continue
             text_regions.append({"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3],
                                  "col": 1, "type": "TEXT", "text": rec})
-            page_txt += re.sub(r"\s+", "", rec)  # 같은 각주의 중복 복원 방지
+            page_txt += _squash(rec)  # 같은 각주의 중복 복원 방지
     # 어느 영역에도 못 들어간 인라인 수식은 독립 수식으로 승격한다(무음 소실 방지).
     isolated += [f for f in weave if id(f) not in woven]
 
@@ -1937,7 +2021,8 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
     body_regions = [r for r in pool if id(r) not in used]
 
     # 다단 페이지 읽기 순서: 칼럼 번호 → y. 단일 칼럼이면 모두 col=1이라 y 순서와 같다.
-    col_bands = column_bands(layout_texts + image_regions)
+    # 밴드는 읽기 순서(order_flow)와 같은 기준으로 오라벨 영역을 걸러 낸 뒤 구한다.
+    col_bands = clean_column_bands(layout_texts + image_regions, page_w)
 
     # 읽기 순서 흐름 구성: 본문/강조박스 + 독립 수식 + 그림
     flow: list[dict] = []
@@ -1951,6 +2036,7 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
                      "col": infer_column(cx, col_bands), "y0": f["y0"], "y1": f["y1"],
                      "x0": f["x0"], "x1": f["x1"]})
     fig_idx = 0
+    page_chars = None               # 내장 표 셀의 글꼴 색인 — 표가 있는 쪽에서만 1회 만든다
     fig_src = hires_image if hires_image is not None else page_image
     s_pt = RENDER_DPI / 72          # 200dpi 픽셀 → PDF 포인트
     page_h_pt = page.get_size()[1]
@@ -1974,10 +2060,11 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
                            or _TABLE_CAP_RE.match(fig.get("caption_text", "")))
         if is_table_region and embedded:
             crop = page_image.crop((fig["x0"], fig["y0"], fig["x1"], fig["y1"]))
-            page_chars = _page_char_index(textpage, s_pt, page_h_pt)
+            if page_chars is None:
+                page_chars = _page_char_index(textpage)
             unresolved = [0]
 
-            def _cell(box, _f=fig, _u=unresolved):
+            def _cell(box, _f=fig, _u=unresolved, page_chars=page_chars):
                 l = (_f["x0"] + box[0]) / s_pt
                 r = (_f["x0"] + box[2]) / s_pt
                 b = page_h_pt - (_f["y0"] + box[3]) / s_pt
@@ -1995,7 +2082,11 @@ def process_page(page, page_image, images_dir: Path, page_no: int,
                 table_md = _accept_table(t_md)
         elif is_table_region and not embedded:
             crop = page_image.crop((fig["x0"], fig["y0"], fig["x1"], fig["y1"]))
-            scan_cell, unreliable = make_scan_cell_fn(crop, tmp_dir, f"tbl{page_no}_{fig_idx}")
+            grid = pdf_table.detect_grid(crop)   # 격자가 없으면 셀도 없다
+            cells = [(cx0, ry0, cx1, ry1) for ry0, ry1 in grid[0]
+                     for cx0, cx1 in grid[1]] if grid else []
+            scan_cell, unreliable = make_scan_cell_fn(
+                crop, tmp_dir, f"tbl{page_no}_{fig_idx}", cells, _TESS_POOL)
             t_md = pdf_table.extract(crop, scan_cell)
             if unreliable[0] == 0:  # 불안정 셀이 하나도 없을 때만 채택
                 table_md = _accept_table(t_md)
@@ -2024,6 +2115,7 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
     # 전에 중단되므로 0바이트 MD 잔해가 남지 않는다(검토단 B3: 잔해가 다음 실행의
     # 이름을 '(1)'로 밀어내 진짜 산출물을 밀쳐내던 문제). 파일 핸들 누수도 없다.
     pdf = pdfium.PdfDocument(str(pdf_path))
+    out_path = None
     try:
         num_pages = len(pdf)
         # MD와 그림 폴더 둘 다 비어 있는 이름을 고른다 — MD만 지워진 잔존 폴더에
@@ -2074,10 +2166,11 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                         force_scan = True
                         print("         낮아서 스캔 경로로 전환합니다"
                               " — 출판사 선행 OCR이 망가진 책입니다.")
-            # 선행 파이프라인: 다음 페이지의 레이아웃+수식검출을 현재 페이지의
-            # 인식 작업과 겹친다. 렌더링만 메인 스레드(pdfium 제약).
-            next_image = None
-            next_future = None
+            # 선행 파이프라인: 다음 쪽의 입력은 메인 스레드가 미리 마련하고
+            # (pdfium 제약), 선행 스레드가 그 쪽의 레이아웃·수식 검출을 한 뒤
+            # Tesseract까지 띄운다 — 스캔본은 다음 쪽의 인식이 이번 쪽의 수식
+            # 인식·마무리와 겹쳐 돈다.
+            nxt = nxt_future = None
             for page_no in range(1, num_pages + 1):
                 if page_no in chapters:
                     out.write(f"# {chapters[page_no]}\n\n")
@@ -2086,50 +2179,39 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 printed = None
                 try:
                     page = pdf[page_no - 1]
-                    page_image = (next_image if next_image is not None
-                                  else page.render(scale=RENDER_DPI / 72).to_pil())
+                    inp = nxt if nxt is not None else prepare_page(page, force_scan)
                     pre = None
-                    if next_future is not None:
+                    if nxt_future is not None:
                         try:
-                            pre = next_future.result()
+                            pre = nxt_future.result()
                         except Exception:
                             pre = None  # 선계산 실패 → 아래에서 동기 재계산
-                    next_image = next_future = None
+                    nxt = nxt_future = None
                     if pre is None:
                         # 프리페치를 던지기 전에 메인에서 동기 계산한다 — 같은 모델
                         # 싱글턴을 두 스레드가 동시에 돌리는 경합(첫 페이지·선계산
                         # 실패 페이지에서 발생)을 차단한다(검토단 지적).
-                        pre = precompute_page(page_image)
+                        pre = precompute_page(inp, tmp_dir, page_no)
                     if page_no < num_pages:  # 다음 페이지 몫을 미리 던져 둔다
                         try:
-                            next_image = pdf[page_no].render(
-                                scale=RENDER_DPI / 72).to_pil()
-                            next_future = _PREFETCH_POOL.submit(
-                                precompute_page, next_image)
+                            nxt = prepare_page(pdf[page_no], force_scan)
+                            nxt_future = _PREFETCH_POOL.submit(
+                                precompute_page, nxt, tmp_dir, page_no + 1)
                         except Exception:
-                            next_image = next_future = None
-                    # 스캔 원본이 기준 해상도보다 높으면 원본 해상도로도 렌더링
-                    # (pdfium은 스레드 불안전이므로 메인 스레드에서만 렌더링한다)
-                    hires = None
-                    ndpi = min(native_scan_dpi(page), HIRES_MAX_DPI)
-                    if ndpi > RENDER_DPI:
-                        hires = page.render(scale=ndpi / 72).to_pil()
+                            nxt = nxt_future = None
                     page_md, n_formulas, source, printed = process_page(
-                        page, page_image, images_dir, page_no, tmp_dir,
-                        pre=pre, hires_image=hires, force_scan=force_scan
-                    )
+                        page, inp, images_dir, page_no, tmp_dir, pre=pre)
                     # 조용한 전멸 방어: 잉크는 있는데 본문이 한 글자도 안 나온
                     # 쪽은 눕힌 스캔일 수 있다(레이아웃이 본문을 그림으로 오분류).
                     # OSD로 세워 한 번만 다시 인식한다.
-                    if not body_chars(page_md) and has_ink(page_image):
-                        fixed, angle = upright_page(page_image, tmp_dir, page_no)
+                    if not body_chars(page_md) and has_ink(inp["image"]):
+                        fixed, angle = upright_page(inp["image"], tmp_dir, page_no)
                         if angle:
                             print(f"    {page_no}페이지: 눕힌 쪽으로 판단해"
                                   f" {angle}도 세워 다시 인식합니다")
                             page_md, n_formulas, source, printed = process_page(
-                                page, fixed, images_dir, page_no, tmp_dir,
-                                force_scan=force_scan
-                            )
+                                page, {**inp, "image": fixed, "hires": None, "ocr": None},
+                                images_dir, page_no, tmp_dir)
                         if not body_chars(page_md):
                             blank_pages.append(page_no)
                 except Exception as e:  # 페이지 하나의 실패가 책 전체를 날리지 않도록
@@ -2150,12 +2232,19 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                     f" (본문: {source}, 수식 {n_formulas}개)"
                 )
             # 완료 표식 — 이 줄이 없으면 중단으로 잘린 파일이다(재실행 판단 근거).
-            # 수식 수는 '검출' 수이며 문서에 실린 수와 다르다(그림 내부 라벨은
-            # 그림 PNG가 이미 담고 있어 본문에서 제외된다) — 오해를 막아 명시한다.
+            # 수식 수는 아래 확정 단계에서 파일 실측값으로 바뀐다(recount_marker).
             out.write(f"\n> [변환 완료] {num_pages}페이지, 검출 수식 {total_formulas}개"
                       + (f", 실패 {failed_pages}페이지" if failed_pages else "")
                       + (f", 본문 못 건진 쪽 {len(blank_pages)}개" if blank_pages else "")
                       + "\n")
+    except BaseException:
+        # 중단돼도 이음 표식만은 확정해 둔다 — 남으면 그 낱말을 grep이 못 찾는다
+        if out_path is not None and out_path.is_file():
+            try:
+                settle_line_joins(out_path)
+            except Exception:
+                pass
+        raise
     finally:
         pdf.close()
 
@@ -2172,18 +2261,23 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
         print("         원본 PDF의 해당 쪽을 확인하세요(눕힌 스캔·특이 레이아웃).")
     print(f"  [저장] {out_path.name} (수식 총 {total_formulas}개)")
 
-    # 자가 감사: 방금 저장한 산출물의 결함(낙오 $·중괄호·깨진 링크·페이지 수)을
-    # 인쇄 쪽번호는 쪽마다 독립으로 읽으므로 오탐이 섞인다 — 이웃과 대조해
-    # 걸러낸다(파일이 다 쓰인 뒤라야 이웃을 볼 수 있다).
+    # 여기부터는 파일이 다 쓰인 뒤라야 할 수 있는 확정 단계다 — 책 전체가
+    # 증거인 줄바꿈 이음, 이웃 쪽과 대조하는 인쇄 쪽번호, 뒤쪽 색인에서 뽑는 용어.
+    try:
+        glued, spaced = settle_line_joins(out_path)
+        if glued or spaced:
+            print(f"  [줄바꿈] 낱말 가운데서 끊긴 줄 {glued}곳을 붙이고 {spaced}곳은 띄웠습니다")
+    except Exception as e:
+        print(f"  [줄바꿈] 이음을 확정하지 못했습니다: {type(e).__name__}")
+
     try:  # 표식의 수식 수를 파일 실측으로 통일한다(스플라이스와 같은 뜻이 되게)
-        import pdf_audit as _audit
         out_path.write_text(
-            _audit.recount_marker(out_path.read_text(encoding="utf-8")),
+            pdf_audit.recount_marker(out_path.read_text(encoding="utf-8")),
             encoding="utf-8")
     except Exception as e:
         print(f"  [표식] 실측 갱신을 못 했습니다: {type(e).__name__}")
 
-    try:
+    try:  # 쪽마다 독립으로 읽은 인쇄 쪽번호에는 오탐이 섞인다 — 이웃과 대조한다
         n_drop, n_fill, n_fix = settle_page_numbers(out_path)
         if n_drop or n_fill or n_fix:
             print(f"  [쪽번호] 오탐 {n_drop}개 제거 · 앵커로 {n_fill}개 보충"
@@ -2198,10 +2292,17 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
     except Exception as e:  # 용어 목록 실패가 성공한 변환을 망치면 안 된다
         print(f"  [용어] 목록을 만들지 못했습니다: {type(e).__name__}")
 
+    # 손으로 넣은 장 앵커가 실제 본문과 맞는지 대조한다(프로파일이 있을 때만).
+    if chapters:
+        try:
+            for msg in pdf_chapters.check_anchors(out_path.read_text(encoding="utf-8"),
+                                                  chapters):
+                print(f"  [장구분] 확인 필요 — {msg}")
+        except Exception as e:
+            print(f"  [장구분] 앵커를 대조하지 못했습니다: {type(e).__name__}")
+
     # 즉시 점검한다. 발견이 있으면 리포트 파일을 MD 옆에 남긴다(없으면 안 남김).
     try:
-        import pdf_audit
-
         summary, report, n_def = pdf_audit.audit_file(out_path)
         print(f"  [감사] {summary}")
         if n_def or "확인 필요" in summary:

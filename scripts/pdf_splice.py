@@ -28,11 +28,10 @@ from pathlib import Path
 from common import exit_with_message, setup_external_tools, tmp_root
 from pdf_ocr import (
     EMBED_MIN_AGREE,
-    HIRES_MAX_DPI,
-    RENDER_DPI,
     embedded_layer_agreement,
-    native_scan_dpi,
+    prepare_page,
     process_page,
+    resolve_joins,
 )
 import pdf_chapters
 import pdf_audit
@@ -111,17 +110,11 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
                 print("  [본문] 스캔 경로로 인식합니다")
             for pno in pages:
                 page = pdf[pno - 1]
-                page_image = page.render(scale=RENDER_DPI / 72).to_pil()
-                hires = None
-                ndpi = min(native_scan_dpi(page), HIRES_MAX_DPI)
-                if ndpi > RENDER_DPI:
-                    hires = page.render(scale=ndpi / 72).to_pil()
                 before = (set(p.name for p in images_dir.glob(f"p{pno}_fig*.png"))
                           if images_dir.is_dir() else set())
                 try:
                     page_md, n_f, source, _printed = process_page(
-                        page, page_image, images_dir, pno, tmp_dir,
-                        pre=None, hires_image=hires, force_scan=force)
+                        page, prepare_page(page, force), images_dir, pno, tmp_dir)
                 except Exception as e:
                     print(f"  {pno}페이지 실패 — 기존 절 유지: {type(e).__name__}: {e}")
                     continue
@@ -136,6 +129,9 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
     finally:
         pdf.close()
 
+    text, glued, spaced = resolve_joins(text)   # 증거는 책 전체다
+    if glued or spaced:
+        print(f"  [줄바꿈] 붙임 {glued}곳 · 띄움 {spaced}곳")
     text = pdf_audit.recount_marker(text)
     md_path.write_text(text, encoding="utf-8")
     summary, _, _ = pdf_audit.audit_file(md_path)

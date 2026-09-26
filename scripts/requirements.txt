@@ -1,10 +1,6 @@
 # PDF Editor 가 실제로 import 하는 것만 담았다 (2026-08-13 정리, dry-run 검증).
-#
-# 왜 requirements.lock 을 쓰지 않는가
-#   그 파일은 2026-07-20 '환경 전체' 스냅숏이라 wandb·polars·numba 처럼 이 도구와
-#   무관한 패키지가 섞여 있고, numba(numpy<2.5) 와 고정된 numpy==2.5.0 이 정면으로
-#   충돌해 **그 파일로는 환경을 다시 만들 수 없다**(ResolutionImpossible 실측).
-#   스냅숏이지 빌드 가능한 명세가 아니다. 이력 참고용으로만 남겨 둔다.
+# 환경 전체를 얼린 잠금 파일은 두지 않는다 — 예전 스냅숏은 무관한 패키지끼리
+# 버전이 충돌해 그것으로는 환경을 다시 만들 수 없었다(ResolutionImpossible 실측).
 #
 # ★★ onnxruntime 은 반드시 -directml 판이어야 한다
 #   일반 onnxruntime 이 같이 깔리면 같은 onnxruntime/ 폴더를 덮어써 iGPU 가속이

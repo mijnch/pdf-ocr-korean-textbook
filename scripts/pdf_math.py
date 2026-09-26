@@ -130,8 +130,9 @@ def load_models():
             # iGPU 가속용 onnxruntime-directml의 DLL을 덮어쓴다(실제로 겪음).
             raise RuntimeError(
                 "수식 인식 라이브러리(pix2text)를 불러올 수 없습니다.\n"
-                "백업에서 복원하세요: Documents\\PDF_Editor_백업\\\n"
-                "pip으로 재설치하면 iGPU 가속 런타임이 깨질 수 있습니다."
+                "도구 폴더의 venv 를 지우고 '환경 설치.bat'을 실행하세요"
+                " (iGPU 가속까지 다시 맞춥니다).\n"
+                "pip으로 직접 재설치하면 iGPU 가속 런타임이 깨질 수 있습니다."
             ) from e
         # 로컬 모델이 없으면 pix2text가 네트워크 다운로드를 시도한다 —
         # '완전 오프라인' 보증을 지키기 위해 먼저 확인하고 명확히 알린다.
@@ -143,7 +144,7 @@ def load_models():
         if not mfd_onnx.is_file():
             raise RuntimeError(
                 f"수식 감지 모델 파일이 없습니다: {mfd_onnx}\n"
-                "백업에서 복원하거나, 인터넷이 되는 환경에서 1회 실행해 받으세요."
+                "도구 폴더의 '환경 설치.bat'을 실행하면 릴리스에서 다시 받습니다."
             )
         _mfd = MathFormulaDetector()
         if not (MFR_KV_DIR / "decoder_with_past_model.onnx").exists():

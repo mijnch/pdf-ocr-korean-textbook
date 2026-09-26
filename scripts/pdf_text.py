@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import statistics
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 
@@ -20,16 +21,18 @@ import tuning
 
 RENDER_DPI = tuning.get("recognition", "render_dpi")        # 기준 렌더 해상도(좌표 공간)
 HIRES_MAX_DPI = tuning.get("recognition", "hires_max_dpi")  # 원본 해상도 활용 상한
+OCR_MIN_DPI = tuning.get("recognition", "ocr_min_dpi")      # 저해상 스캔을 키워 인식할 해상도
 TESS_LANG = tuning.get("recognition", "tess_lang")
 MIN_LINE_CONF = tuning.get("recognition", "min_line_conf")  # 줄 평균 신뢰도 하한
+COL_OUTLIER_RATIO = 0.25   # 제 칼럼 중앙값에서 이만큼(페이지 폭 대비) 벗어나면 오라벨
 # 보충 줄(다른 PSM/해상도만 읽은 줄)의 정밀도 기준 — 주 줄(35)보다 높다. 실측:
 # 진짜 누락 본문 신뢰도 86~94, 밀집 스캔의 오독 파편 36~39로 간격이 커 60에서 분리.
-COL_OUTLIER_RATIO = 0.25   # 제 칼럼 중앙값에서 이만큼(페이지 폭 대비) 벗어나면 오라벨
 RESCUE_MIN_CONF = tuning.get("recognition", "rescue_min_conf")
 RESCUE_MIN_WORDISH = tuning.get("recognition", "rescue_min_wordish")
 MASK_MARGIN = tuning.get("recognition", "mask_margin")
 PAGE_OCR_TIMEOUT = tuning.get("recognition", "page_ocr_timeout")
-# 페이지 분할 모드. 3=자동 레이아웃, 6=단일 블록. 글자 수 많은 쪽 자동 채택.
+# 페이지 분할 모드. 3=자동 레이아웃, 6=단일 블록. 글자 수가 많은 쪽이 주 판독이 되고
+# 다른 쪽은 그것만 읽은 줄의 보충과 줄 투표(vote_lines)의 표로 쓴다.
 PSM_CANDIDATES = ("3", "6")
 
 
@@ -44,6 +47,180 @@ _WORDISH = re.compile(r"[가-힣A-Za-z]")
 _MATH_SPAN = re.compile(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)")
 # 단어 사이에 낀 외톨이 세로줄/역슬래시 노이즈("abc | def" → "abc def"). 수식 밖에서만.
 _BAR_NOISE = re.compile(r"\s+[|\\]\s+")
+
+
+# ─── 줄바꿈 이음 ───
+# 한국어 조판은 낱말 한가운데서도 줄을 바꾼다('전|압을', '생각해보|자'). 줄을 공백으로
+# 이으면 그 낱말이 둘로 갈라져 grep이 놓친다 — 정답지 16쪽 가운데 15쪽에서 관측됐고,
+# 내장 텍스트층 책도 같았다('방 향이', '움 직임', '공기 의'). 그렇다고 무조건 붙이면
+# 진짜 띄어쓰기('나타낼 수|있으며')가 사라진다. 줄 하나만 봐서는 어느 쪽인지 알 수
+# 없으므로, 양쪽이 한글인 이음매에는 표식만 남기고 책이 다 모인 뒤 resolve_joins가
+# 그 책 자신의 표기로 정한다(외부 사전이 아니라 책이 줄 가운데서 쓴 표기가 증거다).
+JOIN = ""
+_EDGE = re.compile(r"^[^0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+$")
+
+
+def _is_hangul(ch: str) -> bool:
+    return "가" <= ch <= "힣"
+
+
+def join_lines(parts) -> str:
+    """줄들을 잇는다. 양쪽이 한글인 이음매에는 공백 대신 JOIN 표식을 둔다."""
+    out = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if out and _is_hangul(out[-1]) and _is_hangul(p[0]):
+            out += JOIN + p
+        else:
+            out = f"{out} {p}" if out else p
+    return out
+
+
+JOIN_MIN_EVIDENCE = 3   # 음절 문맥 판정에 필요한 최소 관측 수
+
+
+def _hangul_edge(text: str, tail: bool) -> str:
+    """글의 끝(tail) 또는 머리의 연속 한글 음절."""
+    m = re.search(r"[가-힣]+$" if tail else r"^[가-힣]+", text)
+    return m.group(0) if m else ""
+
+
+def _contexts(left: str, right: str) -> list[tuple]:
+    """경계 앞뒤 음절 문맥 — 구체적인 것부터: (앞2·뒤2), (앞2·뒤1)+(앞1·뒤2), (앞1·뒤1),
+    마지막으로 앞 음절 하나·뒤 음절 하나를 따로 본 것."""
+    out = []
+    if len(left) >= 2 and len(right) >= 2:
+        out.append([(left[-2:], right[:2])])
+    mid = []
+    if len(left) >= 2:
+        mid.append((left[-2:], right[:1]))
+    if len(right) >= 2:
+        mid.append((left[-1:], right[:2]))
+    if mid:
+        out.append(mid)
+    out.append([(left[-1:], right[:1])])
+    out.append([(left[-1:], ""), ("", right[:1])])   # 한쪽 음절만 보는 마지막 층
+    return out
+
+
+def _join_evidence(evidence: str):
+    """책의 줄 가운데 표기로 이음매 증거 함수(앞 글, 뒤 글) → (확정, 우도비)를 만든다.
+
+    증거는 표식이 닿지 않은 곳만 센다. 수식 바로 뒤 낱말도 세지 않는다 — 수식을
+    끼워 넣을 때 앞뒤에 공백을 두므로('$x$ 는') 그 공백은 책의 표기가 아니다.
+      ① 낱말: 붙인 꼴 XY가 낱말로 쓰인 횟수 대 'X Y'로 띄어 쓰인 횟수. 다르면
+         그것으로 확정한다.
+      ② 음절 문맥: 이음매 앞뒤 음절이 그 책에서 붙어 나온 비율 대 띄어 나온 비율
+         (우도비) — 한국어 자동 띄어쓰기의 표준 방식이다. 구체적인 문맥부터 보고,
+         관측이 모자라면 짧은 문맥으로 물러선다. 확정하지 않고 우도비만 돌려준다 —
+         줄 끝의 사전확률(책마다 다르다)과 곱해야 하기 때문이다.
+    증거가 전혀 없으면 (None, None).
+    """
+    uni: Counter = Counter()
+    bi: Counter = Counter()
+    glued: Counter = Counter()
+    spaced: Counter = Counter()
+    prev = None                                  # (앞 낱말 핵, 끝 한글) — 짝 후보
+    for tok in _MATH_SPAN.sub(" \x00 ", evidence).split():
+        if JOIN in tok or tok == "\x00":
+            prev = None
+            continue
+        core = _EDGE.sub("", tok)
+        if not core:
+            prev = None
+            continue
+        uni[core] += 1
+        for run in re.findall(r"[가-힣]{2,}", tok):
+            for k in range(1, len(run)):
+                for group in _contexts(run[:k], run[k:]):
+                    for c in group:
+                        glued[c] += 1
+        head = _hangul_edge(tok, tail=False)
+        if prev is not None and head and core[0] == tok[0]:
+            bi[(prev[0], core)] += 1
+            for group in _contexts(prev[1], head):
+                for c in group:
+                    spaced[c] += 1
+        tail = _hangul_edge(tok, tail=True)
+        prev = (core, tail) if tail and core[-1] == tok[-1] else None
+    # 우도비의 분모 — 문맥 관측을 붙은 경계·띄운 경계 전체 대비 비율로 바꾼다
+    n_glued = max(1, sum(v for (a, b), v in glued.items() if len(a) == len(b) == 1))
+    n_spaced = max(1, sum(v for (a, b), v in spaced.items() if len(a) == len(b) == 1))
+
+    def evidence_for(a: str, b: str) -> tuple[bool | None, float | None]:
+        x, y = _EDGE.sub("", a), _EDGE.sub("", b)
+        g, s = uni[x + y], bi[(x, y)]
+        lr = None
+        for group in _contexts(_hangul_edge(a, tail=True), _hangul_edge(b, tail=False)):
+            ng = sum(glued[c] for c in group)
+            ns = sum(spaced[c] for c in group)
+            if ng + ns >= JOIN_MIN_EVIDENCE:
+                lr = ((ng + 0.5) / n_glued) / ((ns + 0.5) / n_spaced)
+                break
+        return (g > s if g != s else None), lr
+
+    return evidence_for
+
+
+def join_prior(lrs: list[float]) -> float:
+    """줄 끝에서 붙는 비율(사전확률)을 이음매들의 우도비로 추정한다(EM).
+
+    글자 단위로 줄을 바꾸는 책은 줄 끝이 낱말 가운데일 때가 많고, 낱말 단위로
+    바꾸는 책은 거의 언제나 진짜 띄어쓰기다. 같은 음절 문맥이라도 이 비율에
+    따라 결론이 달라져야 한다. 낱말 수준으로 확정된 것만 세면 치우친다 — 흔한
+    낱말의 안쪽 경계일수록 확정되기 쉬워서 붙임 비율이 부풀려진다(실측 0.70 →
+    0.86). 모든 이음매의 우도비로 혼합 비율을 추정하면 그 치우침이 없다.
+    """
+    if not lrs:
+        return 0.5
+    p = 0.5
+    for _ in range(50):
+        q = sum(p * r / (p * r + 1 - p) for r in lrs) / len(lrs)
+        if abs(q - p) < 1e-4:
+            break
+        p = q
+    return min(max(p, 0.01), 0.99)
+
+
+def resolve_joins(text: str, evidence: str = "") -> tuple[str, int, int]:
+    """JOIN 표식을 붙임 또는 공백으로 확정한다. 반환: (결과, 붙인 수, 띄운 수).
+
+    증거는 text 자신이다(책 전체가 한 파일이므로). evidence는 판정에만 보태는 글이다.
+    낱말 수준에서 확정되지 않은 이음매는 음절 문맥의 우도비에 이 책의 줄 끝
+    사전확률을 곱해 정한다. 증거가 전혀 없으면 띄운다 — 글자를 지어내지 않는 쪽.
+    """
+    if JOIN not in text:
+        return text, 0, 0
+    ev = _join_evidence(text + "\n" + evidence)
+    chunks = re.split(r"(\s+)", text)
+    lrs = []
+    for c in chunks:
+        parts = c.split(JOIN)
+        for a, b in zip(parts, parts[1:]):
+            _f, lr = ev(a, b)
+            if lr is not None:
+                lrs.append(lr)
+    p = join_prior(lrs)
+    prior_odds = p / (1 - p)
+    glued = spaced = 0
+    out = []
+    for c in chunks:
+        parts = c.split(JOIN)
+        acc = parts[0]
+        for b in parts[1:]:
+            f, lr = ev(acc.rsplit(" ", 1)[-1], b)
+            if f is None:
+                f = lr is not None and lr * prior_odds > 1
+            if f:
+                acc += b
+                glued += 1
+            else:
+                acc += " " + b
+                spaced += 1
+        out.append(acc)
+    return "".join(out), glued, spaced
 
 
 def clean_text(text: str) -> str:
@@ -259,12 +436,46 @@ def detect_columns(layout_texts: list[dict], page_w: int) -> list[tuple[int, int
     return out
 
 
-def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_DPI):
-    """이미지 하나를 dual-PSM로 OCR한다. 반환: (줄 목록, 성공 여부, 오류 요약)."""
+def _kill(procs) -> None:
+    """떠 있는 Tesseract를 끝내고 곧바로 거둔다 — 종료 중인 자식이 파일 핸들을
+    물고 다음 저장을 막는 경합을 피한다."""
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+
+
+def _run_tesseract(image_path: Path, psm: str, out_base: Path, dpi: int,
+                   timeout: float = PAGE_OCR_TIMEOUT) -> bool:
+    """Tesseract 한 번을 끝까지 돌린다. 성공 여부만 돌려준다(시간 초과도 실패)."""
+    proc = start_tesseract(image_path, psm, out_base, dpi)
+    try:
+        proc.communicate(timeout=timeout)
+    except Exception:
+        _kill([proc])
+        return False
+    return proc.returncode == 0
+
+
+def _start_ocr(img, tmp_dir: Path, name: str, dpi: int):
+    """이미지 하나의 dual-PSM 인식을 띄운다(기다리지 않는다)."""
     path = tmp_dir / f"{name}.png"
     img.save(path)
     bases = [tmp_dir / f"{name}_psm{psm}" for psm in PSM_CANDIDATES]
-    procs = [start_tesseract(path, psm, b, dpi) for psm, b in zip(PSM_CANDIDATES, bases)]
+    return [start_tesseract(path, psm, b, dpi) for psm, b in zip(PSM_CANDIDATES, bases)], bases
+
+
+def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_DPI,
+               alternates: list | None = None, started=None):
+    """이미지 하나를 dual-PSM로 OCR한다. 반환: (줄 목록, 성공 여부, 오류 요약).
+
+    alternates에 목록을 주면 채택되지 않은 판독(줄 목록)을 거기 덧붙인다.
+    started는 _start_ocr가 미리 띄운 인식이다(여러 칼럼을 동시에 돌릴 때).
+    """
+    procs, bases = started or _start_ocr(img, tmp_dir, name, dpi)
     candidates: list[list[dict]] = []
     ok = False
     err_txt = ""
@@ -280,15 +491,12 @@ def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_
             elif err:
                 err_txt = err.decode("utf-8", "replace").strip()[-200:]
     except Exception:  # 시간 초과 등 — 남은 프로세스를 정리하고 페이지 실패로 넘긴다
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-                try:  # kill 후 즉시 회수 — 종료 중인 자식이 파일 핸들을 물고
-                    proc.communicate(timeout=5)  # 다음 저장을 막는 경합 방지
-                except Exception:
-                    pass
+        _kill(procs)
         raise
     best = max(candidates, key=lambda ls: sum(len(l["text"]) for l in ls)) if candidates else []
+    # 패자 판독은 줄 투표(vote_lines)의 표로 쓴다 — 보충 병합이 줄 사전을 승자
+    # 목록에 옮겨 담으므로 그 전에 사본을 떠 둔다.
+    losers = [[dict(l) for l in cand] for cand in candidates if cand is not best]
     # 승자독식이 '패자만 읽은 줄'을 버리는 무음 소실 차단(실측 p567: PSM6이 총
     # 글자 11자 차로 이기면서 PSM3만 읽은 불릿 2줄이 통째로 사라짐) —
     # 패자 전용 줄(승자와 위치가 안 겹치는 것)만 승자 결과에 보충한다.
@@ -296,10 +504,12 @@ def _ocr_image(img, tmp_dir: Path, name: str, x_off: int = 0, dpi: int = RENDER_
         if cand is not best:
             merge_rescue_lines(best, cand)
     if x_off:
-        for l in best:
+        for l in [l for ls in [best] + losers for l in ls]:
             l["x0"] += x_off
             l["x1"] += x_off
             l["words"] = [(n, a + x_off, b + x_off) for n, a, b in l.get("words", ())]
+    if alternates is not None:
+        alternates.extend(losers)
     return best, ok, err_txt
 
 
@@ -344,18 +554,7 @@ def ocr_region_lines(image, box, tmp_dir: Path, name: str,
     path = tmp_dir / f"{name}.png"
     crop.save(path)
     base = tmp_dir / f"{name}_l"
-    proc = start_tesseract(path, "6", base, dpi)
-    try:
-        proc.communicate(timeout=PAGE_OCR_TIMEOUT)
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-        return []
-    if proc.returncode != 0:
+    if not _run_tesseract(path, "6", base, dpi):
         return []
     try:
         lines = load_tesseract_result(base)
@@ -379,24 +578,13 @@ def ocr_region_text(image, box, tmp_dir: Path, name: str, dpi: int = RENDER_DPI)
     path = tmp_dir / f"{name}.png"
     crop.save(path)
     base = tmp_dir / f"{name}_o"
-    proc = start_tesseract(path, "6", base, dpi)
-    try:
-        proc.communicate(timeout=120)
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-        return ""
-    if proc.returncode != 0:
+    if not _run_tesseract(path, "6", base, dpi, timeout=120):
         return ""
     try:
         txt = base.with_suffix(".txt").read_text(encoding="utf-8")
     except OSError:  # 외부 임시폴더 청소 등 — 복원만 생략하고 페이지는 계속
         return ""
-    txt = " ".join(txt.split())
+    txt = join_lines(" ".join(l.split()) for l in txt.splitlines())
     # 스캔 앱 워터마크(Goodnotes)는 파란 로고가 색 영역으로 잡혀 여기로 들어온다 —
     # 토큰만 제거한다(실제 캡션에 붙어 나온 경우 캡션 본문은 보존).
     txt = _WATERMARK_RE.sub(" ", txt)
@@ -427,18 +615,7 @@ def _ocr_cell_scaled(image, box, scale: int, tmp_dir: Path, name: str):
     path = tmp_dir / f"{name}.png"
     crop.save(path)
     base = tmp_dir / f"{name}_c"
-    proc = start_tesseract(path, "7", base, RENDER_DPI * scale)
-    try:
-        proc.communicate(timeout=60)
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-        return "", 0.0
-    if proc.returncode != 0:
+    if not _run_tesseract(path, "7", base, RENDER_DPI * scale, timeout=60):
         return "", 0.0
     confs = []
     try:
@@ -456,7 +633,7 @@ def _ocr_cell_scaled(image, box, scale: int, tmp_dir: Path, name: str):
     return "".join(txt.split()), mean
 
 
-def make_scan_cell_fn(crop, tmp_dir: Path, name: str):
+def make_scan_cell_fn(crop, tmp_dir: Path, name: str, boxes=(), pool=None):
     """스캔 표 셀 함수 + 불안정 카운터를 만든다.
 
     셀을 두 배율로 OCR해 정규화 결과가 완전히 같고 두 신뢰도가 모두 높을 때만
@@ -464,15 +641,28 @@ def make_scan_cell_fn(crop, tmp_dir: Path, name: str):
     호출부는 카운터가 0일 때만 표를 채택한다 — 위첨자·범위값 등 불안정하게 읽히는
     셀이 하나라도 있으면 표 전체를 버려 '틀린 수치를 표로 내보내는' 위험을 막는다.
     (실측: 정수·소수 셀은 두 배율 일치, '3×10⁶'·'2.3-4.0'은 불일치로 거부됨)
+
+    boxes와 pool을 주면 그 셀들의 두 배율 인식을 미리 한꺼번에 띄운다 — 셀마다
+    외부 프로세스를 두 번씩 차례로 기다리던 것을 동시에 돌린다(판정은 같다).
     """
     counter = [0]
     seq = [0]
+    s1, s2 = SCAN_CELL_SCALES
+    ahead = {}
+    if pool is not None:
+        for i, box in enumerate(boxes):
+            ahead[tuple(box)] = (
+                pool.submit(_ocr_cell_scaled, crop, box, s1, tmp_dir, f"{name}_p{i}a"),
+                pool.submit(_ocr_cell_scaled, crop, box, s2, tmp_dir, f"{name}_p{i}b"))
 
     def fn(box):
-        seq[0] += 1
-        s1, s2 = SCAN_CELL_SCALES
-        t1, c1 = _ocr_cell_scaled(crop, box, s1, tmp_dir, f"{name}_{seq[0]}a")
-        t2, c2 = _ocr_cell_scaled(crop, box, s2, tmp_dir, f"{name}_{seq[0]}b")
+        pending = ahead.get(tuple(box))
+        if pending is not None:
+            (t1, c1), (t2, c2) = pending[0].result(), pending[1].result()
+        else:
+            seq[0] += 1
+            t1, c1 = _ocr_cell_scaled(crop, box, s1, tmp_dir, f"{name}_{seq[0]}a")
+            t2, c2 = _ocr_cell_scaled(crop, box, s2, tmp_dir, f"{name}_{seq[0]}b")
         if not t1 and not t2:
             return ""                       # 양쪽 다 빈 셀 — 진짜 빈칸(불안정 아님)
         if t1 == t2 and min(c1, c2) >= SCAN_CELL_MIN_CONF:
@@ -485,12 +675,15 @@ def make_scan_cell_fn(crop, tmp_dir: Path, name: str):
 
 def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
                     bands: list[tuple[int, int]] | None = None,
-                    dpi: int = RENDER_DPI, tag: str = "") -> list[dict]:
+                    dpi: int = RENDER_DPI, tag: str = "",
+                    alternates: list | None = None) -> list[dict]:
     """그림·수식 영역을 가린 페이지를 Tesseract로 인식해 본문 줄 목록을 반환한다.
 
     다단(bands)이 주어지면 칼럼별로 잘라 따로 인식한다 — 스캔 페이지에서 Tesseract가
-    칼럼을 가로질러 읽어 좌·우단이 한 줄에 섞이는 것을 방지한다.
+    칼럼을 가로질러 읽어 좌·우단이 한 줄에 섞이는 것을 방지한다. 칼럼들은 동시에
+    돌린다(서로 의존이 없다 — 2단 쪽의 벽시계가 칼럼 수만큼 늘던 것을 막는다).
     좌표(mask_boxes/bands/반환 줄 상자)는 모두 page_image의 픽셀 공간이다.
+    alternates에 목록을 주면 채택되지 않은 판독들을 거기 덧붙인다(줄 투표용).
 
     ★ tag는 호출자마다 반드시 달라야 한다 — tmp_dir는 책 한 권 전체가 공유하므로,
     tag가 겹치면 서로 다른 쪽이 같은 임시 PNG(`band{tag}{i}.png`)에 겹쳐 쓴다.
@@ -510,21 +703,30 @@ def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
         )
 
     if bands:
-        all_lines: list[dict] = []
-        failed: list[str] = []
-        for i, (bx0, bx1) in enumerate(bands):
-            cx0 = max(0, int(bx0) - margin)
-            cx1 = min(masked.width, int(bx1) + margin)
-            crop = masked.crop((cx0, 0, cx1, masked.height))
-            lines, ok, err = _ocr_image(crop, tmp_dir, f"band{tag}{i}", x_off=cx0, dpi=dpi)
-            all_lines += lines
-            if not ok:
-                failed.append(f"{i + 1}단" + (f"({err})" if err else ""))
+        started = []
+        try:
+            for i, (bx0, bx1) in enumerate(bands):
+                cx0 = max(0, int(bx0) - margin)
+                cx1 = min(masked.width, int(bx1) + margin)
+                crop = masked.crop((cx0, 0, cx1, masked.height))
+                started.append((cx0, _start_ocr(crop, tmp_dir, f"band{tag}{i}", dpi)))
+            all_lines: list[dict] = []
+            failed: list[str] = []
+            for i, (cx0, st) in enumerate(started):
+                lines, ok, err = _ocr_image(None, tmp_dir, f"band{tag}{i}", x_off=cx0,
+                                            dpi=dpi, alternates=alternates, started=st)
+                all_lines += lines
+                if not ok:
+                    failed.append(f"{i + 1}단" + (f"({err})" if err else ""))
+        except Exception:
+            _kill([p for _cx0, (procs, _b) in started for p in procs])
+            raise
         if failed:  # 한 단이라도 통째 실패면 반 페이지 무음 소실 — 페이지 실패로 알린다
             raise RuntimeError("Tesseract 칼럼 인식 실패: " + ", ".join(failed))
         return all_lines
 
-    lines, ok, err = _ocr_image(masked, tmp_dir, f"page{tag}", dpi=dpi)
+    lines, ok, err = _ocr_image(masked, tmp_dir, f"page{tag}", dpi=dpi,
+                                alternates=alternates)
     if not ok:
         raise RuntimeError("Tesseract 본문 인식 실패" + (f": {err}" if err else ""))
     return lines
@@ -587,6 +789,57 @@ def merge_rescue_lines(primary: list[dict], rescue: list[dict]) -> int:
             seen |= _shingles(s["text"])      # 보충 줄끼리의 중복도 막는다
             added += 1
     return added
+
+
+VOTE_MIN_READINGS = 3    # 투표에 필요한 최소 판독 수(주 판독 포함) — 둘이면 가를 수 없다
+VOTE_SPAN = 0.75         # 가로로 이만큼 겹쳐야 같은 줄의 다른 판독이다
+VOTE_MARGIN = 0.05       # 주 판독보다 이만큼은 더 합의돼야 바꾼다
+
+
+def _same_line(p: dict, q: dict) -> bool:
+    h = max(1.0, min(p["y1"] - p["y0"], q["y1"] - q["y0"]))
+    if min(p["y1"], q["y1"]) - max(p["y0"], q["y0"]) < RESCUE_VOVERLAP * h:
+        return False
+    inter = min(p["x1"], q["x1"]) - max(p["x0"], q["x0"])
+    return inter >= VOTE_SPAN * max(p["x1"] - p["x0"], q["x1"] - q["x0"])
+
+
+def vote_lines(primary: list[dict], readings: list[list[dict]]) -> int:
+    """같은 줄의 여러 판독 가운데 가장 합의된 것을 고른다. 반환: 바꾼 줄 수.
+
+    PSM 두 가지의 승패는 쪽 전체 글자 수로 가린다 — 그래서 줄 단위로는 진 쪽이
+    맞는 일이 흔하다. 실측(전기회로이론 p314, 300dpi): 이긴 PSM6이 '회로에'를
+    '희로에', '전류원은'을 'ARAL', '대체할'을 'HAT', '초기'를 '27]'로 읽었고, 진
+    PSM3과 기준 해상도의 두 판독은 모두 바르게 읽었다. 줄 신뢰도는 93 대 94로
+    가르지 못한다. 대신 판독끼리의 합의를 본다: 각 후보가 나머지와 얼마나
+    닮았는지 더해 가장 가운데 있는 것(메도이드)을 고른다 — 우연한 오독은
+    다른 판독과 어긋나고, 바른 판독은 서로 겹친다.
+
+    같은 줄로 보는 조건은 엄격하다(세로 겹침 + 가로 범위의 75%) — 판독마다 줄을
+    다르게 자르면 비교가 성립하지 않으므로 그런 줄은 건드리지 않는다. 판독이
+    셋 미만이면(고해상 보충이 없는 쪽) 가를 수 없으니 그대로 둔다.
+    """
+    import difflib
+
+    changed = 0
+    for p in primary:
+        alts = []
+        for r in readings:
+            m = [q for q in r if _same_line(p, q)]
+            if len(m) == 1:
+                alts.append(m[0])
+        if len(alts) + 1 < VOTE_MIN_READINGS:
+            continue
+        cands = [p] + alts
+        keys = [re.sub(r"\s+", "", c["text"]) for c in cands]
+        score = [sum(difflib.SequenceMatcher(None, keys[i], keys[j], autojunk=False).ratio()
+                     for j in range(len(cands)) if j != i) for i in range(len(cands))]
+        best = max(range(len(cands)), key=lambda i: (score[i], -i))
+        if best and keys[best] != keys[0] and score[best] > score[0] + VOTE_MARGIN:
+            p["text"] = cands[best]["text"]
+            p["words"] = cands[best].get("words", [])
+            changed += 1
+    return changed
 
 
 def native_scan_dpi(page) -> int:

@@ -21,6 +21,7 @@ DEFAULTS: dict[str, dict[str, tuple]] = {
     "recognition": {           # 본문 인식
         "render_dpi": (200, [72, 600]),          # 기준 렌더 해상도(좌표 공간)
         "hires_max_dpi": (400, [200, 1200]),     # 원본 해상도 활용 상한
+        "ocr_min_dpi": (300, [72, 1200]),        # 저해상 스캔은 이만큼 키워 인식
         "tess_lang": ("kor+eng", None),          # Tesseract 언어 데이터
         "min_line_conf": (35, [0, 100]),         # 줄 평균 신뢰도 하한
         "rescue_min_conf": (60, [0, 100]),       # 보충 줄은 더 엄격(실측 86~94 vs 36~39)
@@ -29,7 +30,7 @@ DEFAULTS: dict[str, dict[str, tuple]] = {
         "mask_margin": (4, [0, 40]),             # 그림·수식 가림 여백
     },
     "layout": {                # 영역 판정
-        "imgsz": (896, [320, 1536]),             # 레이아웃 입력 크기(1024 대비 2배 빠름)
+        "imgsz": (896, [320, 1536]),             # 레이아웃 입력 크기(1024와 검출 동등, 약 1.15배 빠름)
         "conf": (0.2, [0.01, 0.9]),              # 레이아웃 신뢰도 하한
         "header_band_ratio": (0.072, [0.0, 0.3]),   # 머리말 띠(실측 6.8% vs 본문 7.3%)
         "header_ext_ratio": (0.12, [0.0, 0.4]),     # 확장 띠(내용 판정 병행)

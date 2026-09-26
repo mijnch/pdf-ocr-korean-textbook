@@ -35,8 +35,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 VENV_DIR = BASE_DIR / "venv"
-# requirements.lock 은 빌드 불가능한 이력용 스냅숏이다(그 파일 주석 참조).
-# 실제 설치는 소스의 import 에서 뽑은 requirements.txt 를 쓴다.
+# 설치는 소스의 import 에서 뽑은 requirements.txt 를 쓴다(그 파일 주석 참조).
 REQ = Path(__file__).resolve().parent / "requirements.txt"
 VENV_PY = VENV_DIR / "Scripts" / "python.exe"
 
@@ -96,6 +95,10 @@ def main() -> int:
     if VENV_PY.is_file():
         say(f"\n이미 환경이 있습니다: {VENV_DIR}")
         say("다시 만들려면 그 폴더를 지우고 이 스크립트를 다시 실행하세요.")
+        # 환경이 있어도 모델·언어데이터는 확인한다 — 도구가 '모델 파일이 없다'며
+        # 이 스크립트를 안내하므로, 여기서 받지 않으면 그 안내가 헛돈다.
+        if not fetch_assets():
+            return 1
         return verify()
 
     base = find_python()

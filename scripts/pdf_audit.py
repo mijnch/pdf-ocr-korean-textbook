@@ -24,6 +24,8 @@ import re
 import sys
 from pathlib import Path
 
+# 줄바꿈 이음 표식(pdf_text.JOIN과 같은 글자). 감사는 단독 실행되므로 import 없이 둔다.
+JOIN = ""
 _ESCAPED = re.compile(r"\\\$")
 _BLOCK_SPAN = re.compile(r"\$\$([^\n$]+?)\$\$")   # 블록 수식은 항상 한 줄(산출 규약)
 _INLINE_SPAN = re.compile(r"\$([^$\n]+?)\$")
@@ -152,17 +154,16 @@ def recount_marker(md_text: str) -> str:
     return md_text.rstrip("\n") + f"\n\n{marker}\n"
 
 
-_PAGE_SEC = re.compile(r"(?m)^## (\d+)페이지(?: \(인쇄 [^)]*\))?$")
 _SKIP_LINE = ("!", "|", "#", ">", "$$", "*")
 _MATH = re.compile(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)", re.S)
 _HANGUL_ONLY = re.compile(r"[가-힣]")   # 공백을 넣으면 공백 창이 반복으로 잡힌다
 _SUP_OK = re.compile(r"10\^\{")
 _SUP_FLAT = re.compile(r"[Xx×]\s*10[-−]?\d")
-_BRACKETS = re.compile(r"\\left|\\right")
 
 
-def _page_sections(md_text: str):
-    marks = [(int(m.group(1)), m.start()) for m in _PAGE_SEC.finditer(md_text)]
+def page_sections(md_text: str):
+    """'## N페이지' 절마다 (쪽 번호, 절 전문)을 차례로 낸다(용어집·장 앵커 대조도 쓴다)."""
+    marks = [(int(m.group(1)), m.start()) for m in _PAGE_HDR.finditer(md_text)]
     for i, (pno, s) in enumerate(marks):
         e = marks[i + 1][1] if i + 1 < len(marks) else len(md_text)
         yield pno, md_text[s:e]
@@ -176,7 +177,7 @@ def empty_pages(md_text: str, min_chars: int = 10) -> list[str]:
     구멍을 막는 항목이다.
     """
     out = []
-    for pno, sec in _page_sections(md_text):
+    for pno, sec in page_sections(md_text):
         body = 0
         for line in sec.split("\n")[1:]:
             s = line.strip()
@@ -196,7 +197,7 @@ def flat_exponent_cells(md_text: str) -> list[str]:
     앞으로 새로 생길 변형을 잡기 위해 감사에도 둔다.
     """
     out = []
-    for pno, sec in _page_sections(md_text):
+    for pno, sec in page_sections(md_text):
         rows = "\n".join(l for l in sec.split("\n") if l.startswith("|"))
         if rows and _SUP_OK.search(rows) and _SUP_FLAT.search(rows):
             out.append(f"{pno}페이지")
@@ -318,6 +319,9 @@ def audit_file(md_path: Path) -> tuple[str, str, int]:
                        f"표식 {r['완료표식'][0]}페이지")
     if r["실패페이지수"]:
         defects.append(f"■ 인식 실패 페이지: {r['실패페이지수']}건")
+    joins = md_text.count(JOIN)
+    if joins:  # 확정 전에 멈춘 파일 — 이 자리의 낱말은 grep에 안 걸린다
+        defects.append(f"■ 확정되지 않은 줄바꿈 이음 표식: {joins}건")
     # ── 내용 쪽 점검 ──────────────────────────────────────────────
     # 위 항목은 전부 '구문'이다. 검토단 실증: 300쪽 전부 빈 책도, 표 셀의 지수가
     # 통째로 날아간 책도 구문상 완벽해서 '결함 0건'을 받았다. 원본과 대조하는
@@ -350,7 +354,7 @@ def audit_file(md_path: Path) -> tuple[str, str, int]:
     n_def = (len(r["낙오달러"]) + len(r["중괄호불균형"]) + len(broken)
              + len(render_broken) + len(empty) + len(flat)
              + (0 if r["완료표식"] and r["완료표식"][0] == r["페이지절수"] else 1)
-             + r["실패페이지수"])
+             + r["실패페이지수"] + joins)
     n_sus = (len(r["퇴화반복"]) + len(orphans) + len(dupes) + len(brackets)
              + len(orphan_ex))
     summary = (f"결함 {n_def}건"

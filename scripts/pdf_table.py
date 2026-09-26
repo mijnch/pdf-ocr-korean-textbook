@@ -111,9 +111,7 @@ def detect_grid(crop) -> tuple[list[tuple[int, int]], list[tuple[int, int]]] | N
             # 21열 → 탈락). 진짜 열 구분자는 '모든 행 밴드에서 완전히 빈 세로줄'
             # 이므로, 행 밴드 화소만 모아 그 기준으로 다시 나눠 본다. 위 방식이
             # 이미 성사된 표는 건드리지 않는다(추가 기회일 뿐 — 회귀 없음).
-            import numpy as _np
-
-            band = _np.concatenate([a[r0:r1] for r0, r1 in rows], axis=0)
+            band = np.concatenate([a[r0:r1] for r0, r1 in rows], axis=0)
             strict = _gutter_cols(~band.any(axis=0), w)
             if 2 <= len(strict) <= MAX_COLS:
                 cols = strict

@@ -86,11 +86,46 @@ def force_scan(pdf_stem: str) -> bool:
     return pdf_stem in _FORCE_SCAN
 
 
+ANCHOR_WINDOW = 3   # 앵커 앞뒤 이만큼의 쪽에서 장 제목을 찾는다
+
+
+def check_anchors(md_text: str, chapters: dict[int, str]) -> list[str]:
+    """장 제목이 앵커 쪽 근처 본문에 실제로 있는지 확인한다. 반환: 어긋난 장의 설명.
+
+    장 제목·앵커는 손으로 넣는 데이터라 틀려도 아무도 알려주지 않는다 — 실제로
+    공학수학1 제3장 앵커가 13쪽 밀려 있던 것을 이 대조로 잡았다(2026-08-01).
+    제목에서 장 번호('제3장', 'Chapter 3')를 뗀 나머지를 공백 없이 찾는다.
+    앵커 쪽이나 바로 앞 쪽(장 표지)에 있으면 맞는 것으로 본다.
+    """
+    import re
+
+    import pdf_audit
+
+    pages = {p: re.sub(r"\s+", "", sec) for p, sec in pdf_audit.page_sections(md_text)}
+    problems = []
+    for anchor, title in sorted(chapters.items()):
+        body = title.split(" ", 1)[1] if " " in title else ""
+        needle = re.sub(r"\s+", "", body)
+        if not needle:
+            problems.append(f"{title} ({anchor}쪽): 제목에 장 번호만 있어 확인할 수 없음")
+            continue
+        hits = [p for p in range(anchor - ANCHOR_WINDOW, anchor + ANCHOR_WINDOW + 1)
+                if needle in pages.get(p, "")]
+        if anchor in hits or anchor - 1 in hits:
+            continue
+        problems.append(f"{title} ({anchor}쪽): "
+                        + (f"실제로는 {', '.join(map(str, hits))}쪽에 있음" if hits
+                           else f"앞뒤 {ANCHOR_WINDOW}쪽 안에서 못 찾음"))
+    return problems
+
+
 def toc_block(chapters: dict[int, str]) -> list[str]:
     """머리 목차 블록(문서 앞에 넣을 줄 목록). 장이 없으면 빈 목록."""
     if not chapters:
         return []
-    lines = ["## 장 구분(자동 감지)", ""]
+    # 자동 감지가 아니라 사람이 넣은 프로파일이다 — 제목이 그렇게 말해야 AI가
+    # 이 목록의 신뢰도를 제대로 가늠한다.
+    lines = ["## 장 구분", ""]
     lines += [f"- {title} — {page}페이지" for page, title in sorted(chapters.items())]
     lines.append("")
     return lines

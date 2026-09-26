@@ -16,6 +16,8 @@ MD 머리에 싣는다. AI가 목록을 보면 그 책의 어휘로 다시 검�
 import re
 from collections import Counter
 
+from pdf_audit import page_sections
+
 # 색인은 줄 단위가 아니라 '용어 쪽번호 용어 쪽번호 …'가 한 문단으로 이어붙어
 # OCR된다('대역 차단 678 대역 통과 필터 676 대역폭 669'). 그래서 줄 파서가 아니라
 # 짝의 스트림으로 훑는다 — finditer가 겹치지 않게 순서대로 잘라 준다.
@@ -24,17 +26,9 @@ _INDEX_PAIR = re.compile(
     r"\s*(?P<pages>\d{1,4}(?:\s*[,~\-]\s*\d{1,4})*)")
 # 색인 쪽 판정: 한 쪽에서 이만큼 짝이 나오면 색인으로 본다(본문은 이 밀도가 안 됨).
 _INDEX_MIN_HITS = 25
-_PAGE_SEC = re.compile(r"(?m)^## (\d+)페이지(?: \(인쇄 [^)]*\))?$")
 _STOP = re.compile(r"^(?:그림|표|예제|문제|연습|장|절|페이지|참고|부록)\b")
 _SENT_END = re.compile(r"(?:다|라|자|요)[.。]")
 GLOSSARY_MAX = 400          # 머리말이 지나치게 길어지지 않게 상한을 둔다
-
-
-def _sections(md_text: str):
-    marks = [(int(m.group(1)), m.start()) for m in _PAGE_SEC.finditer(md_text)]
-    for i, (pno, s) in enumerate(marks):
-        e = marks[i + 1][1] if i + 1 < len(marks) else len(md_text)
-        yield pno, md_text[s:e]
 
 
 def _strip_noise(sec: str) -> str:
@@ -69,7 +63,7 @@ def _is_index_page(sec: str) -> bool:
 def index_terms(md_text: str) -> list[str]:
     """찾아보기 쪽에서 용어 후보를 뽑는다(중복 제거, 등장 순서 유지)."""
     seen: dict[str, None] = {}
-    for _pno, sec in _sections(md_text):
+    for _pno, sec in page_sections(md_text):
         if not _is_index_page(sec):
             continue
         for t in _page_pairs(sec):
@@ -92,7 +86,7 @@ def build(md_text: str, min_body_hits: int = 2) -> list[str]:
     terms = index_terms(md_text)
     if not terms:
         return []
-    body = "\n".join(sec for _p, sec in _sections(md_text)
+    body = "\n".join(sec for _p, sec in page_sections(md_text)
                      if not _is_index_page(sec))
     counts = Counter()
     for t in terms:

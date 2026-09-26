@@ -260,7 +260,7 @@ check("sem flow no false heading",
           [{"btype": "text", "text": "정의역은 집합이다.", "x0": 100, "x1": 400, "col": 1}],
           1000) if l.startswith("###")])
 
-# ─── prune_page_number_outliers: 이웃과 어긋나는 인쇄 쪽번호 제거 ───
+# ─── settle_page_numbers: 이웃 대조·증가열·앵커 보충으로 인쇄 쪽번호 확정 ───
 def _mk(pairs):
     """(pdf쪽, 인쇄쪽 또는 None) 목록 → 임시 MD 파일."""
     body = "\n\n".join(f"## {p}페이지" + (f" (인쇄 {q}쪽)" if q else "") + "\n\n본문"
@@ -664,8 +664,17 @@ else:
           f"({pdf_chapters.PROFILE_PATH.name} 은 개인 설정이라 배포되지 않습니다)")
 check("chapters unknown book", pdf_chapters.for_book("없는책") == {})
 check("chapters toc", pdf_chapters.toc_block({11: "제1장 가", 37: "제2장 나"})
-      == ["## 장 구분(자동 감지)", "", "- 제1장 가 — 11페이지", "- 제2장 나 — 37페이지", ""])
+      == ["## 장 구분", "", "- 제1장 가 — 11페이지", "- 제2장 나 — 37페이지", ""])
 check("chapters toc empty", pdf_chapters.toc_block({}) == [])
+# 앵커 대조: 앵커 쪽(또는 바로 앞 장 표지)에 제목이 있으면 조용하고, 어긋나면 알린다
+_chmd = ("## 10페이지\n\n제1장\n\n## 11페이지\n\n회로 기초 개념\n\n"
+         "## 12페이지\n\n본문\n\n## 13페이지\n\n교류 해석\n")
+check("anchor ok", pdf_chapters.check_anchors(_chmd, {11: "제1장 회로 기초 개념"}) == [])
+check("anchor cover ok", pdf_chapters.check_anchors(_chmd, {12: "제1장 회로 기초 개념"}) == [])
+_bad = pdf_chapters.check_anchors(_chmd, {11: "제2장 교류 해석"})
+check("anchor moved", len(_bad) == 1 and "13쪽" in _bad[0])
+check("anchor missing", "못 찾음" in pdf_chapters.check_anchors(_chmd, {11: "제3장 없음"})[0])
+check("anchor number only", "장 번호만" in pdf_chapters.check_anchors(_chmd, {11: "제4장"})[0])
 
 # ─── 그림 링크 괄호 안전화(재실행 '(1)' 이름에서 링크가 끊기던 결함) ───
 check("link plain", pdf_ocr.md_link_path("책_OCR_images/p1_fig1.png")
@@ -742,6 +751,58 @@ with tempfile.TemporaryDirectory() as td:
     check("tsv pair count", len(lines) == 1)  # 저신뢰 줄은 탈락
     check("tsv $ escape", lines and lines[0]["text"] == r"안녕 세\$상")
     check("tsv box", lines and lines[0]["x0"] == 10 and lines[0]["y1"] == 30)
+
+# ─── 줄바꿈 이음: 낱말 가운데서 끊긴 줄을 책 자신의 표기로 잇는다 ───
+J = pdf_text.JOIN
+check("join mark hangul", pdf_text.join_lines(["커패시터의 전", "압을 선택"]) == f"커패시터의 전{J}압을 선택")
+check("join space latin", pdf_text.join_lines(["RC", "회로에"]) == "RC 회로에")
+check("join space punct", pdf_text.join_lines(["이다.", "다시"]) == "이다. 다시")
+check("join skip empty", pdf_text.join_lines(["가", " ", "나"]) == f"가{J}나")
+_ev = "전압을 측정한다. " * 5 + "나타낼 수 있다. " * 5
+check("resolve glue word", pdf_text.resolve_joins(f"전{J}압을", _ev)[0] == "전압을")
+check("resolve space word", pdf_text.resolve_joins(f"수{J}있다", _ev)[0] == "수 있다")
+check("resolve no evidence spaces",  # 증거가 없으면 글자를 지어내지 않는 쪽(띄움)
+      pdf_text.resolve_joins(f"갸{J}뷁")[0] == "갸 뷁")
+check("resolve counts", pdf_text.resolve_joins(f"전{J}압을 수{J}있다", _ev)[1:] == (1, 1))
+check("resolve untouched", pdf_text.resolve_joins("표식 없음") == ("표식 없음", 0, 0))
+check("resolve math ignored",  # 수식 뒤 공백('$x$ 는')은 책의 띄어쓰기 증거가 아니다
+      pdf_text.resolve_joins(f"값{J}는", "$x$ 는 " * 9 + "값는 ")[0] == "값는")
+check("prior empty", pdf_text.join_prior([]) == 0.5)
+check("prior glue-heavy", pdf_text.join_prior([50.0] * 20) > 0.9)
+check("prior space-heavy", pdf_text.join_prior([0.02] * 20) < 0.1)
+check("audit join same char", J == pdf_audit.JOIN)
+with tempfile.TemporaryDirectory() as td:  # 확정 못 한 표식은 grep을 깨뜨리므로 결함이다
+    _f = Path(td) / "j_OCR.md"
+    _f.write_text(f"## 1페이지\n\n커패시터의 전{J}압을 측정한다.\n\n"
+                  "> [변환 완료] 1페이지, 수식 0개\n",
+                  encoding="utf-8")
+    _s, _rep, _nd = pdf_audit.audit_file(_f)
+    check("audit join leftover", _nd == 1 and "줄바꿈 이음" in _rep)
+
+# ─── 줄 투표: PSM 승자독식이 줄 단위로 틀린 판독을 고르는 것을 바로잡는다 ───
+def _vl(t, x0=100, y0=100, x1=900, y1=130):
+    return {"text": t, "x0": x0, "y0": y0, "x1": x1, "y1": y1, "words": []}
+
+
+_pv = [_vl("희로에 전압을 걸면 전류원은 ARAL 흐른다")]
+_good = "회로에 전압을 걸면 전류원은 전류가 흐른다"
+check("vote replace", pdf_text.vote_lines(_pv, [[_vl(_good)], [_vl(_good, y0=102, y1=128)]]) == 1
+      and _pv[0]["text"] == _good)
+_pv2 = [_vl("희로에 ARAL")]
+check("vote needs three", pdf_text.vote_lines(_pv2, [[_vl("회로에 전류원은")]]) == 0
+      and _pv2[0]["text"] == "희로에 ARAL")
+_pv3 = [_vl("희로에 ARAL")]
+check("vote other line ignored",  # 가로 범위가 크게 다르면 같은 줄의 다른 판독이 아니다
+      pdf_text.vote_lines(_pv3, [[_vl(_good, x1=400)], [_vl(_good, x1=400)]]) == 0)
+_pv4 = [_vl(_good)]
+check("vote keep consensus",
+      pdf_text.vote_lines(_pv4, [[_vl(_good)], [_vl("희로에 ARAL 흐른다")]]) == 0)
+
+# ─── 인쇄 쪽번호 확정: 쪽 절이 하나도 없는 파일(반환 형식 결함 고정) ───
+with tempfile.TemporaryDirectory() as td:
+    _f = Path(td) / "x.md"
+    _f.write_text("# 빈 문서\n", encoding="utf-8")
+    check("settle empty", pdf_ocr.settle_page_numbers(_f) == (0, 0, 0))
 
 print(f"\n{'ALL PASS' if not FAIL else f'{len(FAIL)}건 실패'} "
       f"(총 {TOTAL}건)")
