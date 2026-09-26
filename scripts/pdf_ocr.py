@@ -485,11 +485,15 @@ def _region_pixels(page_image, region: dict, size: int) -> list:
 
     고해상 판독의 좌표를 기준 공간으로 나누면 1픽셀 미만 높이의 줄 상자가 생긴다
     (실측 전자기학 p176) — 그대로 줄이면 PIL이 예외를 내 쪽 전체가 실패한다.
+    상자는 쪽 경계로 자른다: 텍스트층 글자 상자가 망가진 PDF는 줄 좌표가 쪽 밖
+    수만 픽셀로 튀고(실측 강의록: 51억 화소 크롭), PIL이 압축 폭탄으로 보고 막는다.
     """
-    crop = page_image.crop((round(region["x0"]), round(region["y0"]),
-                            round(region["x1"]), round(region["y1"])))
-    if crop.width < 1 or crop.height < 1:
+    x0, y0 = max(0, round(region["x0"])), max(0, round(region["y0"]))
+    x1 = min(page_image.width, round(region["x1"]))
+    y1 = min(page_image.height, round(region["y1"]))
+    if x1 - x0 < 1 or y1 - y0 < 1:
         return []
+    crop = page_image.crop((x0, y0, x1, y1))
     return list(crop.convert("RGB").resize((size, size)).getdata())
 
 

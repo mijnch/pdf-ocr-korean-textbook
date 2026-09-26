@@ -798,6 +798,14 @@ _pv4 = [_vl(_good)]
 check("vote keep consensus",
       pdf_text.vote_lines(_pv4, [[_vl(_good)], [_vl("희로에 ARAL 흐른다")]]) == 0)
 
+# ─── 색 판정 크롭: 망가진 좌표에도 쪽 전체가 실패하지 않는다 ───
+_img = _PILImage.new("RGB", (200, 100), (255, 255, 255))
+check("region tiny", pdf_ocr.colored_ratio(_img, {"x0": 10, "y0": 5, "x1": 60, "y1": 5.4}) == 0.0)
+check("region off-page",  # 텍스트층 좌표가 쪽 밖 수만 픽셀로 튄 줄(압축 폭탄 오판 방지)
+      pdf_ocr.tinted_ratio(_img, {"x0": -5e4, "y0": 10, "x1": 7e4, "y1": 7e4}) == 0.0)
+check("region clipped", pdf_ocr.colored_ratio(
+    _PILImage.new("RGB", (100, 100), (200, 30, 30)), {"x0": 50, "y0": 50, "x1": 900, "y1": 900}) == 1.0)
+
 # ─── 인쇄 쪽번호 확정: 쪽 절이 하나도 없는 파일(반환 형식 결함 고정) ───
 with tempfile.TemporaryDirectory() as td:
     _f = Path(td) / "x.md"
