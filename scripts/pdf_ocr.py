@@ -1470,6 +1470,29 @@ def insert_glossary(md_path: Path) -> int:
     return len(terms)
 
 
+def resume_point(md_text: str, pdf_name: str, num_pages: int) -> tuple[int, int] | None:
+    """중단된 산출물을 이어 쓸 자리 — (다시 시작할 쪽, 잘라 낼 글자 위치). 못 이으면 None.
+
+    완료 표식이 있으면 다 된 파일이라 잇지 않는다(새 이름으로 따로 만든다). 첫 줄의
+    원본 이름이 다르면 다른 책이다. 마지막 쪽 절은 쓰다가 끊겼을 수 있으므로 그 쪽부터
+    다시 만든다 — 그 앞의 장 제목('# …')은 다시 쓰이므로 함께 잘라 낸다.
+    """
+    if "> [변환 완료]" in md_text or not md_text.startswith(f"# {pdf_name}\n"):
+        return None
+    heads = list(_PAGE_HEAD_ANY.finditer(md_text))
+    if not heads:
+        return 1, len(md_text)          # 머리만 쓰고 멈췄다
+    page = int(heads[-1].group(1))
+    if page > num_pages:
+        return None
+    cut = heads[-1].start()
+    before = md_text[:cut].rstrip("\n")
+    line_start = before.rfind("\n") + 1
+    if before[line_start:].startswith("# "):
+        cut = line_start
+    return page, cut
+
+
 def _discard_output(out_path: Path, images_dir: Path) -> None:
     """쓸모없는 산출물을 지운다 — 잔해가 정식 이름을 선점하지 못하게."""
     out_path.unlink(missing_ok=True)
@@ -2174,6 +2197,23 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
         base = output_dir / f"{pdf_path.stem}_OCR.md"
         out_path, n = base, 0
         out = None
+        start_page = 1
+        # 같은 책이 중단된 채 남아 있으면 이어 쓴다 — 천 쪽짜리 책을 중간에 멈추면
+        # 처음부터 다시 돌려야 했다(실측 응용수학 488쪽에서 중지 → 1시간 반 손실).
+        rp = (resume_point(base.read_text(encoding="utf-8", errors="replace"),
+                           pdf_path.name, num_pages) if base.is_file() else None)
+        if rp is not None:
+            start_page, cut = rp
+            done = base.read_text(encoding="utf-8", errors="replace")[:cut]
+            base.write_text(done, encoding="utf-8")
+            imgs = base.with_name(f"{base.stem}_images")
+            if imgs.is_dir():  # 다시 만들 쪽의 옛 그림은 지운다(그림 수가 줄면 고아가 된다)
+                for f in imgs.glob("p*_fig*.png"):
+                    m = re.match(r"p(\d+)_fig", f.name)
+                    if m and int(m.group(1)) >= start_page:
+                        f.unlink()
+            out = open(base, "a", encoding="utf-8")
+            print(f"  [이어하기] 중단된 산출물을 {start_page}쪽부터 이어 씁니다")
         while out is None:
             if not out_path.with_name(f"{out_path.stem}_images").exists():
                 try:
@@ -2187,11 +2227,11 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
 
         # dir=tmp_root(): 페이지 이미지 수백 MB가 %TEMP% 가 아니라 도구 폴더 안에
         # 생기게 한다(tmp_root()가 None이면 tempfile 기본값으로 물러선다).
-        with tempfile.TemporaryDirectory(dir=tmp_root()) as tmp, out:
+        # 정리 오류는 무시한다 — 중단 순간 다음 쪽의 Tesseract가 임시 파일을 쥐고
+        # 있으면 정리가 PermissionError를 내고, 그 예외가 Ctrl+C를 덮어써 '이 책
+        # 실패'로 처리된 뒤 다음 책으로 넘어가 버린다(실측).
+        with tempfile.TemporaryDirectory(dir=tmp_root(), ignore_cleanup_errors=True) as tmp, out:
             tmp_dir = Path(tmp)
-            out.write(f"# {pdf_path.name}\n\n")
-            out.write(ai_preamble(pdf_path.name, images_dir.name,
-                                  pdf_path.stat().st_size) + "\n\n")
             # 장 구분: 등록된 프로파일이 있으면 머리 목차 + 해당 쪽 앞 장 제목을
             # 자동으로 넣는다(없으면 기존처럼 장 헤딩 없이 진행).
             chapters = pdf_chapters.for_book(pdf_path.stem, num_pages)
@@ -2199,9 +2239,14 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 print("  [경고] 등록된 장 구분 프로파일이 이 문서의 쪽 수와 맞지"
                       " 않아 적용하지 않습니다 (같은 파일명의 다른 문서인지"
                       " 확인하세요).")
-            toc = pdf_chapters.toc_block(chapters)
-            if toc:
-                out.write("\n".join(toc) + "\n")
+            if rp is None:   # 이어 쓸 때는 머리(제목·안내·목차)가 이미 있다
+                out.write(f"# {pdf_path.name}\n\n")
+                out.write(ai_preamble(pdf_path.name, images_dir.name,
+                                      pdf_path.stat().st_size) + "\n\n")
+                toc = pdf_chapters.toc_block(chapters)
+                if toc:
+                    out.write("\n".join(toc) + "\n")
+            if chapters:
                 print(f"  [장구분] 프로파일 적용: {len(chapters)}개 장")
             force_scan = pdf_chapters.force_scan(pdf_path.stem)
             if force_scan:
@@ -2221,7 +2266,7 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
             # Tesseract까지 띄운다 — 스캔본은 다음 쪽의 인식이 이번 쪽의 수식
             # 인식·마무리와 겹쳐 돈다.
             nxt = nxt_future = None
-            for page_no in range(1, num_pages + 1):
+            for page_no in range(start_page, num_pages + 1):
                 if page_no in chapters:
                     out.write(f"# {chapters[page_no]}\n\n")
                 # 쪽 제목은 인식이 끝난 뒤에 쓴다 — 머리말에서 읽어낸 인쇄
@@ -2490,10 +2535,9 @@ def main() -> None:
     # '(1)'로 밀려나 사람도 AI도 잘린 파일을 먼저 연다(검토단 실증).
     stale = find_stale_outputs(output_dir)
     if stale:
-        print(f"[경고] 완료 표식이 없는(중단된) 산출물 {len(stale)}개가 출력 폴더에"
+        print(f"[알림] 완료 표식이 없는(중단된) 산출물 {len(stale)}개가 출력 폴더에"
               f" 있습니다: {', '.join(stale[:5])}")
-        print("       지우고 다시 돌리는 것을 권합니다 — 그대로 두면 새 결과가"
-              " '이름 (1).md'로 저장됩니다.\n")
+        print("       같은 PDF를 다시 변환하면 끊긴 쪽부터 이어 씁니다.\n")
 
     print(f"=== {FEATURE}: {len(pdfs)}개 파일 처리 (본문: 한국어+영어, 수식: LaTeX) ===")
     print("(레이아웃·수식 인식 모델을 로드하는 중입니다...)\n")

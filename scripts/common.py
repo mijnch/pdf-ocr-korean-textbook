@@ -89,9 +89,9 @@ def find_skipped_subfolders(input_dir: Path) -> list[str]:
 def find_stale_outputs(output_dir: Path, marker: str = "> [변환 완료]") -> list[str]:
     """완료 표식이 없는 잘린 산출물 목록 — 이전 실행이 중단된 잔해다.
 
-    잔해가 정식 이름('책_OCR.md')을 차지한 채 남으면 다음 실행의 완성본이
-    '책_OCR (1).md'로 밀려나고, 사람도 AI도 자연스럽게 잔해를 먼저 연다
-    (검토단 실증). 실행 시작 때 알려 주어 지우고 다시 돌리게 한다.
+    같은 PDF를 다시 변환하면 끊긴 쪽부터 이어 쓰므로(pdf_ocr.resume_point) 지울
+    필요는 없다. 다만 사람도 AI도 잘린 파일을 완성본으로 읽을 수 있으니 실행 시작 때
+    알린다.
     """
     out = []
     for f in sorted(output_dir.glob("*_OCR.md")):

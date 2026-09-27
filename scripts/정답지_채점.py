@@ -87,7 +87,7 @@ def rerun(books: dict, pages: dict[str, list[int]]) -> dict[tuple[str, int], str
     pdf_layout.load_parser()
     pdf_math.load_models()
     out: dict[tuple[str, int], str] = {}
-    with tempfile.TemporaryDirectory(dir=common.tmp_root()) as tmp:
+    with tempfile.TemporaryDirectory(dir=common.tmp_root(), ignore_cleanup_errors=True) as tmp:
         tmp_dir = Path(tmp)
         for tag, plist in pages.items():
             book = books[tag]

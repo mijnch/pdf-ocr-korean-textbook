@@ -824,6 +824,18 @@ _got = dict(pdf_ocr.settle_pairs(_ch1))
 check("repeat real one kept", _got.get(16) == 1 and _got.get(17) == 2)
 check("repeat false ones dropped", 5 not in _got and 9 not in _got)
 
+# ─── 이어 하기: 중단된 산출물을 어디서부터 다시 쓸지 ───
+_rp_head = "# 책.pdf\n\n> **AI 안내**: 안내\n\n"
+_rp = _rp_head + "## 1페이지\n\n가\n\n# 제2장 나\n\n## 2페이지 (인쇄 5쪽)\n\n반쯤 쓰다"
+_p, _cut = pdf_ocr.resume_point(_rp, "책.pdf", 10)
+check("resume last page redone", _p == 2)
+check("resume cuts chapter heading", _rp[:_cut].rstrip().endswith("가"))   # 장 제목도 다시 쓴다
+check("resume header only", pdf_ocr.resume_point(_rp_head, "책.pdf", 10) == (1, len(_rp_head)))
+check("resume done file", pdf_ocr.resume_point(_rp + "\n> [변환 완료] 2페이지, 수식 0개\n",
+                                                "책.pdf", 10) is None)
+check("resume other book", pdf_ocr.resume_point(_rp, "다른책.pdf", 10) is None)
+check("resume too many pages", pdf_ocr.resume_point(_rp, "책.pdf", 1) is None)
+
 # ─── 인쇄 쪽번호 확정: 쪽 절이 하나도 없는 파일(반환 형식 결함 고정) ───
 with tempfile.TemporaryDirectory() as td:
     _f = Path(td) / "x.md"

@@ -95,7 +95,7 @@ def splice(pdf_path: Path, md_path: Path, pages: list[int]) -> None:
     try:
         if max(pages) > len(pdf):
             exit_with_message(f"원본 PDF는 {len(pdf)}페이지입니다: {max(pages)}페이지 없음")
-        with tempfile.TemporaryDirectory(dir=tmp_root()) as tmp:
+        with tempfile.TemporaryDirectory(dir=tmp_root(), ignore_cleanup_errors=True) as tmp:
             tmp_dir = Path(tmp)
             # 전권 변환과 같은 판정을 쓴다 — 스플라이스만 내장층을 덥석 믿으면
             # 망가진 층을 가진 책의 쪽이 조용히 나빠진다(실측: 전기회로이론
