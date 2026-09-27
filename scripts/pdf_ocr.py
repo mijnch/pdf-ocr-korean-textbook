@@ -1921,11 +1921,22 @@ def process_page(page, inp: dict, images_dir: Path, page_no: int,
                                       "type": "TEXT", "text": text, "nocap": True})
             fig_boxes.remove((r["x0"], r["y0"], r["x1"], r["y1"]))
 
-    # 그림 내부에 들어온 줄·수식 라벨 제거 (그림 PNG에 이미 포함되어 중복·잡음이 됨)
+    # 그림 내부에 들어온 줄·수식 라벨 제거 (그림 PNG에 이미 포함되어 중복·잡음이 됨).
+    # 머리말 띠 안의 줄도 버리되, 레이아웃이 띠 아래로 이어지는 본문 영역으로 잡은
+    # 곳 안의 줄은 본문이다 — 상단 여백이 좁은 자료에서 첫 문단의 윗줄들이 띠 안에
+    # 들어오는데, 한국어 본문 한 줄은 40~50자라 '60자 넘으면 본문' 보호에 걸리지
+    # 않아 통째로 사라졌다(재현: 응용수학 p487 위 6%를 자르면 첫 문단 3줄 소실).
+    # 러닝 헤더는 레이아웃이 '버림'으로 따로 잡는다(스캔본 표본 150쪽 전부).
+    def in_body_region(ln: dict) -> bool:
+        cx, cy = (ln["x0"] + ln["x1"]) / 2, (ln["y0"] + ln["y1"]) / 2
+        return any(r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
+                   for r in layout_texts)
+
     lines = [ln for ln in lines
              if not in_figure(ln)
              and (ln["y1"] > header_band
-                  or len(ln.get("text", "")) > HEADER_MAX_CHARS)]
+                  or len(ln.get("text", "")) > HEADER_MAX_CHARS
+                  or in_body_region(ln))]
     # 위치 띠(7.2%)를 벗어난 머리말 잔존(스캔 크롭 변동): 확장 띠(12%) 안에서
     # '쪽번호 + 장 표지' 내용 형태만 추가로 버린다 — 쪽번호 없는 절 표제
     # ('연습문제 1.2' 등)는 본문이므로 보존된다.
