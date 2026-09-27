@@ -60,6 +60,17 @@ os.environ["YOLO_AUTOINSTALL"] = "false"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+# ultralytics 계열은 온라인이면 예측마다 사용 통계를 모아 60초마다 Google Analytics로
+# 보낸다(설정 파일의 고정 uuid 포함 — 전송 호출을 가로채 확인). 수식 검출이 쓰는 본가는
+# YOLO_OFFLINE으로 끈다(레이아웃이 쓰는 포크 doclayout_yolo는 이 변수를 몰라
+# pdf_layout.load_parser가 따로 막는다). 둘 다 사용자 %APPDATA%에 만들던 설정 파일을
+# 도구 폴더 안에 둔다 — 본가는 이 폴더가 없으면 현재 폴더에 만들므로 미리 만든다.
+os.environ["YOLO_OFFLINE"] = "1"
+os.environ["YOLO_CONFIG_DIR"] = str(TMP_ROOT / "yolo")
+try:
+    (TMP_ROOT / "yolo").mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 
 def feature_dirs(feature: str) -> tuple[Path, Path]:

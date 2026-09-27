@@ -40,15 +40,29 @@ DROP_TYPES = {"IGNORED", "ABANDON"}  # 머리말/꼬리말/쪽번호 등
 _parser = None
 
 
+def _refuse_connection(*_args, **_kwargs):
+    raise OSError("오프라인 도구 — 외부 연결을 하지 않는다")
+
+
 def load_parser():
     """레이아웃 분석 모델을 lazy-load한다. 미설치 시 RuntimeError."""
     global _parser
     if _parser is None:
         try:
             import logging
+            import socket
 
             logging.disable(logging.INFO)
-            from pix2text.doc_yolo_layout_parser import DocYoloLayoutParser
+            # doclayout_yolo(ultralytics 8.1 포크)는 YOLO_OFFLINE을 모른다 — import 때
+            # 1.1.1.1·8.8.8.8에 연결해 보고, 되면 예측마다 사용 통계를 Google Analytics로
+            # 보낸다(실측). import 동안만 연결을 거절해 오프라인으로 판정되게 한다 —
+            # 통계·PyPI 버전 확인이 함께 꺼진다.
+            connect = socket.create_connection
+            socket.create_connection = _refuse_connection
+            try:
+                from pix2text.doc_yolo_layout_parser import DocYoloLayoutParser
+            finally:
+                socket.create_connection = connect
         except ImportError as e:
             # pip으로 재설치하라고 안내하면 안 된다 — pix2text는 onnxruntime(CPU판)을
             # 끌어와 iGPU 가속용 onnxruntime-directml의 DLL을 덮어쓴다(실제로 겪음).
