@@ -1574,16 +1574,15 @@ def split_regions(regions: list[dict], page_image):
     layout_texts = [r for r in regions if r["kind"] == "text"]
     drop_boxes = [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in regions if r["kind"] == "drop"]
     # 레이아웃이 머리말을 TEXT로 잘못 남긴 페이지의 누수 차단: 페이지 상단 띠에
-    # 완전히 들어간 텍스트 영역·본문 줄은 러닝 헤더이므로 버린다.
+    # 완전히 들어간 텍스트 영역은 러닝 헤더로 보고 인식에서 가린다.
     # 임계 7.2%: 5권 실측에서 머리말은 y1≤6.8%H에서 끝나고, 본문 첫 줄은
     # (스캔북 포함) y0≥7.3%H에서 시작한다 — 양쪽 모두 여유가 있는 경계값.
-    # 다만 비율만 믿으면 상단 여백이 좁은 자료(강의 슬라이드, 여백 없는 조판)의
-    # 매 쪽 첫 줄 — 대개 장·절 제목 — 을 말없이 잘라낸다(검토단 실증). 띠 안의
-    # 글이 러닝 헤더답게 '짧을' 때만 버린다. 러닝 헤더는 쪽번호·장제목 조각이라
-    # 짧고, 본문 첫 줄은 문장이거나 제목이라 길다.
+    # 이 시점의 영역에는 아직 글자가 없어 길이로는 가를 수 없다(여기 있던 '짧을
+    # 때만' 조건은 늘 참이었다). 상단 여백이 좁은 자료의 첫 줄 보호는 인식 뒤
+    # 줄 단위로 한다 — process_page의 머리말 띠 필터. 띠에 완전히 들어간 텍스트
+    # 영역은 스캔본 표본 150쪽에 한 건도 없었다(러닝 헤더는 레이아웃이 '버림'으로 잡음).
     header_band = HEADER_BAND_RATIO * page_image.height
-    in_band = [r for r in layout_texts
-               if r["y1"] <= header_band and len(r.get("text", "")) <= HEADER_MAX_CHARS]
+    in_band = [r for r in layout_texts if r["y1"] <= header_band]
     drop_boxes += [(r["x0"], r["y0"], r["x1"], r["y1"]) for r in in_band]
     _dropped = {id(r) for r in in_band}
     layout_texts = [r for r in layout_texts if id(r) not in _dropped]
