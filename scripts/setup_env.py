@@ -17,7 +17,7 @@
   다른 PC에서 동작하지 않았다. 폴더 안에 두면 폴더가 곧 환경이 된다.
 
 ★ 이 스크립트가 못 하는 것 (별도 프로그램이라 폴더에 넣을 성격이 아니다)
-  - Tesseract-OCR : 대상 PC에 설치돼 있어야 한다 (common.TESSERACT_DIR)
+  - Tesseract-OCR : 대상 PC에 설치돼 있어야 한다 (기본 경로 또는 PATH — common.find_tesseract)
   - Python 본체   : venv 를 만들려면 대상 PC에 Python 3.14 가 필요하다
 
 ★ DirectML 주의 (과거 실제 사고)
@@ -93,13 +93,25 @@ def main() -> int:
         return 1
 
     if VENV_PY.is_file():
-        say(f"\n이미 환경이 있습니다: {VENV_DIR}")
-        say("다시 만들려면 그 폴더를 지우고 이 스크립트를 다시 실행하세요.")
-        # 환경이 있어도 모델·언어데이터는 확인한다 — 도구가 '모델 파일이 없다'며
-        # 이 스크립트를 안내하므로, 여기서 받지 않으면 그 안내가 헛돈다.
-        if not fetch_assets():
-            return 1
-        return verify()
+        # 이 PC에서 실제로 기동되는지까지 확인한다 — 폴더째 옮겨 온 venv 는 파일은 있어도
+        # pyvenv.cfg 가 가리키는 파이썬이 없으면 기동되지 않는다. 예전에는 파일만 보고
+        # '이미 환경이 있습니다'로 건너뛰어, README대로 폴더를 복사하면 고칠 길이 없었다.
+        try:
+            alive = subprocess.run([str(VENV_PY), "-c", "import sys"],
+                                   capture_output=True, timeout=60).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            alive = False
+        if alive:
+            say(f"\n이미 환경이 있습니다: {VENV_DIR}")
+            say("다시 만들려면 그 폴더를 지우고 이 스크립트를 다시 실행하세요.")
+            # 환경이 있어도 모델·언어데이터는 확인한다 — 도구가 '모델 파일이 없다'며
+            # 이 스크립트를 안내하므로, 여기서 받지 않으면 그 안내가 헛돈다.
+            if not fetch_assets():
+                return 1
+            return verify()
+        say("\nvenv 가 있지만 이 PC에서 기동되지 않습니다 (다른 PC에서 만들어진 것).")
+        say("  지우고 다시 만듭니다...")
+        shutil.rmtree(VENV_DIR, ignore_errors=True)
 
     base = find_python()
     if not base:
@@ -213,13 +225,16 @@ def verify() -> int:
         say("  → ★ DirectML 이 없습니다. iGPU 가속 없이 CPU로만 돕니다.")
         say("     고치려면:  venv\\Scripts\\python -m pip install --force-reinstall onnxruntime-directml")
 
-    # Tesseract — 폴더 밖 의존물이라 여기서 만들어 줄 수 없다
+    # Tesseract — 폴더 밖 의존물이라 여기서 만들어 줄 수 없다.
+    # 변환과 같은 방법(기본 경로 → PATH)으로 찾는다 — 따로 찾으면 둘의 판정이 어긋난다.
     say("")
-    tess = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-    if tess.is_file():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from common import TESSERACT_DIR, find_tesseract
+    tess = find_tesseract()
+    if tess:
         say(f"  OK   Tesseract: {tess}")
     else:
-        say(f"  ★    Tesseract 가 없습니다: {tess}")
+        say(f"  ★    Tesseract 가 없습니다 (기본 경로 {TESSERACT_DIR}에도, PATH에도 없음)")
         say("       별도 프로그램이라 이 스크립트가 설치하지 못합니다. 직접 설치하세요.")
         ok = False
 

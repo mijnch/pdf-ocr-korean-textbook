@@ -842,6 +842,26 @@ with tempfile.TemporaryDirectory() as td:
     _f.write_text("# 빈 문서\n", encoding="utf-8")
     check("settle empty", pdf_ocr.settle_page_numbers(_f) == (0, 0, 0))
 
+# ─── 외부 도구: Tesseract는 기본 경로를 먼저, 없으면 PATH에서 찾는다 ───
+import common  # noqa: E402
+
+_saved_dir, _saved_which = common.TESSERACT_DIR, common.shutil.which
+try:
+    with tempfile.TemporaryDirectory() as td:
+        common.TESSERACT_DIR = Path(td)
+        common.shutil.which = lambda name: "/elsewhere/tesseract"
+        check("tesseract from PATH", common.find_tesseract() == Path("/elsewhere/tesseract"))
+        (Path(td) / "tesseract.exe").write_bytes(b"")
+        check("tesseract default path first", common.find_tesseract() == Path(td) / "tesseract.exe")
+        (Path(td) / "tesseract.exe").unlink()
+        common.shutil.which = lambda name: None
+        check("tesseract not found", common.find_tesseract() is None)
+finally:
+    common.TESSERACT_DIR, common.shutil.which = _saved_dir, _saved_which
+
+# 병렬로 띄운 Tesseract끼리 OpenMP 스레드를 다투지 않게 한다(Linux 실측: 쪽마다 시간 초과)
+check("tesseract OpenMP limited", pdf_text._tess_env().get("OMP_THREAD_LIMIT") == "1")
+
 print(f"\n{'ALL PASS' if not FAIL else f'{len(FAIL)}건 실패'} "
       f"(총 {TOTAL}건)")
 sys.exit(1 if FAIL else 0)

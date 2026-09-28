@@ -21,6 +21,20 @@ if not exist "%PY%" (
   set "PY=python"
 )
 
+rem venv 의 python.exe 는 있어도, 폴더째 다른 PC로 옮겨 와 연결된 Python 본체가 없으면
+rem 기동하지 못한다. 원인 불명 오류 대신 무엇을 하면 되는지 알린다.
+rem 블록 안 echo 에는 괄호를 쓰지 않는다 - 닫는 괄호가 블록을 끝내 버린다.
+"%PY%" -c "import sys" >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo  [오류] 파이썬을 실행할 수 없습니다.
+  echo         venv 는 만들어진 PC의 Python 3.14 를 가리키므로 다른 PC로 옮기면 그대로 쓸 수 없습니다.
+  echo         도구 폴더의 "환경 설치.bat" 을 실행하면 이 PC에 맞게 새로 만들어집니다.
+  echo.
+  pause
+  exit /b 1
+)
+
 "%PY%" "%~dp0..\scripts\pdf_ocr.py" %*
 
 echo.
