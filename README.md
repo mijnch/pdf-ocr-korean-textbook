@@ -15,7 +15,7 @@
 | **온디바이스 가속** | 수식 인식 모델을 **KV캐시 + int8로 재제작**해 인식 4.16배 · 인코더는 내장 GPU(DirectML) |
 | **규모** | 실제 교재 **9권 7,530쪽** 재변환, 페이지 실패 0 |
 | **정확도** | 원본 쪽 대조 **문자 일치율 93.8% · 낱말 회수율 96.5%** (8권 16쪽 전사 대조) |
-| **검증** | 골든 테스트 286건 (모델 없이 실행, CI) + 원본 쪽 정답지 채점 스크립트 |
+| **검증** | 골든 테스트 290건 (모델 없이 실행, CI) + 원본 쪽 정답지 채점 스크립트 |
 | **설치** | `환경 설치.bat` 한 번 — 모델 252MB는 릴리스에서 자동으로 받는다 |
 
 <details>
@@ -46,7 +46,7 @@ Guiding rule: **a wrong table or page number is worse than none.** Tables whose 
 trusted are kept only as PNG; page numbers that cannot be confirmed are dropped.
 
 Measured on 9 real textbooks (7,530 pages): 0 page failures, 93.8% character accuracy and 96.5%
-word recall against hand-transcribed pages (8 books, 16 pages). 286 golden tests run without models
+word recall against hand-transcribed pages (8 books, 16 pages). 290 golden tests run without models
 in CI. Windows-first; Korean UI.
 
 </details>
@@ -366,7 +366,7 @@ DLL만 바뀌어, **`import` 버전과 `dist-info` 버전이 어긋난 혼성 �
 | **원본 쪽 대조** | **문자 일치율 93.8% · 낱말 회수율 96.5%** — 8권 16쪽 전사 대조, 재변환한 말뭉치 (이전 93.4% · 94.3%) |
 | 기계 교차 대조 | 산문 회수 95.6% · 정밀도 98.5% — 내장층 있는 책 504쪽 |
 | 인쇄 쪽번호 회수 | 90.5~97.2% · 중복 0 · 역행 0 (쪽번호가 인쇄되지 않은 판본 1권은 0이 정답) |
-| 골든 테스트 | 286건 (모델·외부 프로세스 없이 실행). CI는 매 push마다 Windows·Python 3.14에서 돌리며, 개인 장 구분 파일이 필요한 2건은 건너뛴다 |
+| 골든 테스트 | 290건 (모델·외부 프로세스 없이 실행). CI는 매 push마다 Windows·Python 3.14에서 돌리며, 개인 장 구분 파일이 필요한 2건은 건너뛴다 |
 | 저장소 크기 | 소스 380KB — 모델 252MB는 릴리스 자산 |
 
 가속: 수식 인식 모델을 KV캐시 + int8로 재제작하고(인식 4.16배), 인코더를 DirectML(iGPU)에
@@ -384,11 +384,21 @@ DLL만 바뀌어, **`import` 버전과 `dist-info` 버전이 어긋난 혼성 �
 둘 다 막고 설정은 `.tmp/` 안에 둡니다 — 모델을 올리고 인식하는 동안 외부 연결·DNS
 시도가 0건임을 소켓 수준에서 확인했습니다.
 
+**새 클론으로 다시 확인했습니다.** GitHub에서 새로 받아 릴리스 자산만 붙이고, 네트워크를
+아예 없앤 격리 환경(Linux)에서 변환해 보니 두 가지가 드러났습니다. 의존성(matplotlib)이
+글꼴 캐시를 **사용자 홈에** 만들었고, 동시에 띄운 Tesseract들이 OpenMP 스레드를 다투며
+**쪽마다 180초 제한을 넘겨 변환이 실패**했습니다(Tesseract 단독으로는 쪽당 1초 미만).
+지금은 캐시를 `.tmp/` 안에 두고 Tesseract에만 `OMP_THREAD_LIMIT=1`을 겁니다 — 같은 조건에서
+변환이 끝까지 되고, 홈·임시 폴더·실행 위치에 남는 것이 없음을 확인했습니다.
+Windows에서 이 스레드 제한이 속도에 주는 영향은 아직 재지 않았습니다.
+
 큰 자산을 저장소에 넣지 않은 이유는 단순합니다 — **소스는 380KB인데 모델은 252MB**입니다.
 Git LFS 대신 릴리스 자산을 고른 것은 clone에 LFS 설정을 요구하지 않고,
 받는 시점을 설치 스크립트가 통제할 수 있어서입니다.
 
 `venv/`가 없으면 `PDF OCR 실행.bat`은 시스템 Python으로 물러섭니다 — 기존 사용 방식도 그대로 됩니다.
+폴더째 다른 PC로 옮겨 와 `venv/`가 그 PC에서 기동하지 않으면(venv는 만든 PC의 Python 경로를 가리킵니다),
+실행은 원인과 할 일을 알리고 멈추며 `환경 설치.bat`은 그것을 지우고 새로 만듭니다.
 
 ## 설치와 실행
 
@@ -404,8 +414,8 @@ PDF OCR 실행.bat     # 입력 폴더의 PDF를 변환
 
 | | 왜 필요한가 | 없으면 |
 |---|---|---|
-| **Python 3.14** | `venv`를 만들 바탕 | 설치 스크립트가 멈추고 알려줍니다 |
-| **Tesseract 5.4** (kor+eng) | 본문 OCR | 변환이 시작되지 않습니다 |
+| **Python 3.14** | `venv`를 만들 바탕 — PATH에 없어도 `py` 런처로 찾습니다 | 설치 스크립트가 멈추고 알려줍니다 |
+| **Tesseract 5.4** | 본문 OCR — 기본 경로(`C:\Program Files\Tesseract-OCR`)를 먼저, 없으면 PATH에서 찾습니다. 한국어 언어 데이터는 도구 폴더의 것을 쓰므로 따로 깔 필요가 없습니다 | 변환이 시작되지 않습니다 |
 
 회귀 점검은 모델 없이 돕니다. 품질은 원본 쪽을 옮겨 적은 정답지로 잽니다:
 
@@ -431,7 +441,7 @@ venv\Scripts\python scripts\정답지_채점.py --rerun  # 정답지 쪽을 현�
 | `scripts/정답지_채점.py` | 원본 쪽 정답지 대조 (문자 일치율 · 낱말 회수율) |
 | `scripts/setup_env.py` | 폴더 안 venv 구성 · 자산 내려받기 · 가속 검증 |
 | `scripts/common.py` | 외부 도구 경로 · 오프라인 가드 |
-| `scripts/tests/test_pure.py` | 순수 함수 골든 테스트 286건 |
+| `scripts/tests/test_pure.py` | 순수 함수 골든 테스트 290건 |
 | `설정.toml` / `장구분.example.toml` | 임계값·장 구분 프로파일 (코드 수정 없이 조정) |
 
 ## 범위와 한계
