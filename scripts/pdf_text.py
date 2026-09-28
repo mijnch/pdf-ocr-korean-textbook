@@ -9,6 +9,7 @@ pdf_ocr가 쓰는 인식 I/O를 모아 둔 모듈이다. 페이지 전체 OCR(�
 
 from __future__ import annotations
 
+import os
 import re
 import statistics
 import subprocess
@@ -250,6 +251,21 @@ def clean_text(text: str) -> str:
 _WATERMARK_RE = re.compile(r"(?i)(made\s+with\s+)?go+dnotes\s*/?")
 
 
+def _tess_env() -> dict[str, str]:
+    """Tesseract 자식 프로세스의 환경 — OpenMP 스레드를 프로세스당 1개로 묶는다.
+
+    이 도구는 Tesseract를 여러 개 동시에 띄운다(두 분할 모드 × 두 해상도, 다음 쪽 선행
+    인식). OpenMP로 빌드된 Tesseract는 프로세스마다 코어 수만큼 스레드를 띄워 서로와
+    모델 추론을 다툰다 — 새 클론을 Linux(Tesseract 5.3.4, 4코어)에서 돌리자 쪽마다
+    180초 제한을 넘겨 두 쪽 모두 실패했고, 이 변수 하나로 같은 PDF가 20초에 끝났다.
+    도구 전역이 아니라 Tesseract에만 건다 — 전역에 걸면 같은 프로세스의 다른 OpenMP
+    사용자까지 1스레드로 묶인다(lecture-transcriber에서 CTranslate2가 그렇게 느려졌다).
+    호출할 때마다 만든다 — setup_external_tools가 나중에 바꾸는 PATH·TESSDATA_PREFIX를
+    그대로 물려받아야 한다.
+    """
+    return {**os.environ, "OMP_THREAD_LIMIT": "1"}
+
+
 def start_tesseract(image_path: Path, psm: str, out_base: Path,
                     dpi: int = RENDER_DPI) -> subprocess.Popen:
     """페이지 이미지 OCR을 백그라운드로 시작한다.
@@ -265,6 +281,7 @@ def start_tesseract(image_path: Path, psm: str, out_base: Path,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,  # 실패 원인을 삼키지 않는다(페이지 실패 메시지에 실림)
+        env=_tess_env(),
     )
 
 
@@ -285,7 +302,7 @@ def detect_rotation(image_path: Path) -> int:
     try:
         r = subprocess.run(["tesseract", str(image_path), "stdout",
                             "-l", "osd", "--psm", "0"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=60, env=_tess_env())
     except (OSError, subprocess.SubprocessError):
         return 0
     m = _OSD_ANGLE.search(r.stdout or "")
@@ -307,7 +324,7 @@ def ocr_top_band(page_image, tmp_dir: Path, tag: str, ratio: float = 0.072) -> s
         strip.save(path)
         r = subprocess.run(
             ["tesseract", str(path), "stdout", "--psm", "7", "-l", TESS_LANG],
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, env=_tess_env())
         return (r.stdout or b"").decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError):
         return ""
