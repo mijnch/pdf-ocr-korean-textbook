@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -71,6 +72,11 @@ try:
     (TMP_ROOT / "yolo").mkdir(parents=True, exist_ok=True)
 except OSError:
     pass
+# matplotlib(pix2text·ultralytics가 끌어온다)은 글꼴 캐시를 사용자 홈에 만든다 — 새 클론을
+# 네트워크 없이 돌렸더니 홈에 fontlist 캐시가 생겼다(Linux 실측, Windows는 문서상
+# %USERPROFILE%\.matplotlib). 폴더를 스스로 만들므로 경로만 도구 폴더 안으로 돌린다.
+# matplotlib 이 import 되기 전이어야 하므로 여기 둔다.
+os.environ["MPLCONFIGDIR"] = str(TMP_ROOT / "matplotlib")
 
 
 def feature_dirs(feature: str) -> tuple[Path, Path]:
@@ -130,6 +136,20 @@ def human_size(num_bytes: float) -> str:
         num_bytes /= 1024
 
 
+def find_tesseract() -> Path | None:
+    """Tesseract 실행 파일을 찾는다 — 기본 설치 경로를 먼저, 없으면 PATH를 본다.
+
+    기본 경로를 먼저 보는 것은 지금까지 실측한 PC의 동작을 바꾸지 않기 위해서다.
+    예전에는 기본 경로만 봐서, 다른 곳에 설치했거나 PATH에만 있으면 '설치되어 있지
+    않습니다'로 멈췄다. 언어 데이터는 어느 쪽이든 도구 폴더의 TESSDATA_DIR을 쓴다.
+    """
+    exe = TESSERACT_DIR / "tesseract.exe"
+    if exe.is_file():
+        return exe
+    found = shutil.which("tesseract")
+    return Path(found) if found else None
+
+
 def setup_external_tools() -> None:
     """Tesseract를 PATH에 추가하고 한국어 언어 데이터를 지정한다.
 
@@ -139,9 +159,11 @@ def setup_external_tools() -> None:
     도구가 없으면 RuntimeError를 던진다.
     (자동 pip 설치 차단은 모듈 import 시점에 이미 걸어 둔다 — 위 os.environ 참조.)
     """
-    if not (TESSERACT_DIR / "tesseract.exe").exists():
+    tesseract = find_tesseract()
+    if tesseract is None:
         raise RuntimeError(
-            "Tesseract가 설치되어 있지 않습니다.\n"
+            "Tesseract가 설치되어 있지 않습니다"
+            f" (기본 경로 {TESSERACT_DIR}에도, PATH에도 없습니다).\n"
             "https://github.com/UB-Mannheim/tesseract/wiki 에서 설치하세요."
         )
 
@@ -153,8 +175,10 @@ def setup_external_tools() -> None:
                 "eng.traineddata를 받아 위 경로에 넣으세요."
             )
 
+    # 찾은 것을 PATH 맨 앞에 둔다 — 인식 호출은 이름('tesseract')으로 하므로, 그래야
+    # PATH에 다른 판이 먼저 있어도 여기서 고른 실행 파일이 쓰인다.
     os.environ["PATH"] = os.pathsep.join(
-        [str(TESSERACT_DIR), os.environ.get("PATH", "")])
+        [str(tesseract.parent), os.environ.get("PATH", "")])
     os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
 
     # 장시간 변환 중 백그라운드 작업에 CPU를 뺏기지 않도록 HIGH 우선순위로 실행
