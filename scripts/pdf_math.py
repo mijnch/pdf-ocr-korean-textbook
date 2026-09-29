@@ -92,7 +92,7 @@ _mfr = None
 def _try_igpu_encoder(mfr, encoder_path: Path) -> None:
     """MFR 인코더 세션만 iGPU(DirectML)로 교체한다. 실패하면 CPU 그대로.
 
-    실측(공학수학1 5페이지): 인코더 배치 1.60배 -> 파이프라인 전체 1.21배.
+    실측(2026-09 재측정): 인코더 1.57배 -> 수식 인식 1.51배 -> 파이프라인 전체 1.37배.
     디코더(int8 연산자는 DML 미지원)와 MFD(전송 오버헤드로 이득 상쇄)는 CPU 유지.
     onnxruntime-directml이 없거나 optimum 내부 구조가 바뀌면 조용히 CPU로 남는다.
     """

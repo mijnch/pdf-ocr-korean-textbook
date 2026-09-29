@@ -12,7 +12,7 @@
 |---|---|
 | **입력 → 출력** | 교재 PDF(스캔본 · 내장 텍스트층) → 쪽별 Markdown + 그림 PNG |
 | **동작 방식** | 전부 로컬 (Tesseract · pix2text ONNX · pdfium). 인식 중 외부 연결·DNS 시도 0건을 소켓 수준에서 확인 |
-| **온디바이스 가속** | 수식 인식 모델을 **KV캐시 + int8로 재제작**해 인식 4.16배 · 인코더는 내장 GPU(DirectML) |
+| **온디바이스 가속** | 수식 인식 모델을 **KV캐시 + int8로 재제작**해 인식 4.16배 · 인코더를 내장 GPU(DirectML)로 옮겨 **전체 1.37배** |
 | **규모** | 실제 교재 **9권 7,530쪽** 재변환, 페이지 실패 0 |
 | **정확도** | 원본 쪽 대조 **문자 일치율 93.8% · 낱말 회수율 96.5%** (8권 16쪽 전사 대조) |
 | **검증** | 골든 테스트 290건 (모델 없이 실행, CI) + 원본 쪽 정답지 채점 스크립트 |
@@ -34,7 +34,8 @@ The problem was access, not reading quality: the assistant's PDF reader refuses 
   cache (O(n²) generation) and its PyTorch weights are not published, so the ONNX initializers were
   transplanted into an identical `transformers` model, re-exported with past key/values and
   quantized to int8 — **4.16× faster recognition** on a 305-formula A/B. The encoder runs on the
-  laptop iGPU via DirectML while the CPU decodes the previous batch.
+  laptop iGPU via DirectML while the CPU decodes the previous batch (encoder 1.57×, formula recognition
+  1.51×, end-to-end 1.37×).
 - **text** — the embedded text layer when a 12-page self-check against Tesseract says it can be
   trusted; otherwise Tesseract kor+eng in 2 segmentation modes × 2 resolutions with per-line
   consensus voting
@@ -141,7 +142,7 @@ GPU 서버나 클라우드 API 없이 **노트북의 CPU와 내장 GPU만으로*
 
 | 단계 | 장치 | 근거 |
 |---|---|---|
-| 수식 인식 인코더 | 내장 GPU (DirectML) | iGPU가 다음 배치를 인코딩하는 동안 CPU가 현재 배치를 디코딩한다. 배치 구성이 순차 경로와 같아 출력도 같다 (305크롭 305/305 일치) |
+| 수식 인식 인코더 | 내장 GPU (DirectML) | **인코더 1.57배 · 수식 인식 1.51배 · 전체 1.37배.** iGPU가 다음 배치를 인코딩하는 동안 CPU가 현재 배치를 디코딩한다. 배치 구성이 순차 경로와 같아 출력도 같다 (305크롭 305/305 일치) |
 | 수식 인식 디코더 | CPU (int8) | int8 연산자를 DirectML이 지원하지 않는다 |
 | 수식 검출 | CPU | iGPU로 옮기면 전송 오버헤드가 이득을 상쇄한다 |
 | 쪽 사이 | CPU 스레드 겹침 | 다음 쪽의 렌더링·레이아웃 분석·Tesseract가 이번 쪽의 수식 인식과 동시에 돈다 (4권 × 20쪽: 쪽당 시간 −15% · −15% · −16% · −27%) |
@@ -370,7 +371,7 @@ DLL만 바뀌어, **`import` 버전과 `dist-info` 버전이 어긋난 혼성 �
 | 저장소 크기 | 소스 380KB — 모델 252MB는 릴리스 자산 |
 
 가속: 수식 인식 모델을 KV캐시 + int8로 재제작하고(인식 4.16배), 인코더를 DirectML(iGPU)에
-올렸습니다 — 인코더 약 1.53배, 파이프라인 약 1.27배. 설계는 [온디바이스 추론](#온디바이스-추론--노트북-한-대에서-오프라인으로) 참조.
+올렸습니다 — 인코더 1.57배, 수식 인식 1.51배, 전체 1.37배. 설계는 [온디바이스 추론](#온디바이스-추론--노트북-한-대에서-오프라인으로) 참조.
 
 ## 배포 설계
 
