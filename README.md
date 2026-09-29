@@ -50,6 +50,9 @@ Measured on 9 real textbooks (7,530 pages): 0 page failures, 93.8% character acc
 word recall against hand-transcribed pages (8 books, 16 pages). 290 golden tests run without models
 in CI. Windows-first; Korean UI.
 
+Built with an AI coding assistant (Claude Code), as the `Co-Authored-By` trailers show. Problem
+definition, measurement on real textbooks, and the decision to adopt each design are mine.
+
 </details>
 
 ---
@@ -475,6 +478,12 @@ Tesseract 자체의 인식 한계라 이 파이프라인의 후처리로는 복�
 장 구분은 `장구분.example.toml`을 `장구분.toml`로 복사해 쓰는 책에 맞게 채웁니다
 (실제 사용 프로파일은 저장소에 포함하지 않습니다). 변환이 끝나면 각 장 제목이 앵커 쪽
 근처 본문에 실제로 있는지 대조해 어긋난 앵커를 알려 줍니다.
+
+## 만든 방식
+
+코드와 문서는 AI 코딩 도구(Claude Code)와 함께 작성했습니다 — 커밋의 `Co-Authored-By` 표시가
+그 기록입니다. 무엇을 풀지와 무엇을 받아들일지는 제가 정했습니다: 문제 정의, 실제 교재로 한
+실측과 원본 대조, 그리고 각 설계를 채택할지의 판단입니다.
 
 ## 라이선스
 
