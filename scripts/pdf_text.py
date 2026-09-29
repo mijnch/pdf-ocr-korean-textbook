@@ -59,6 +59,13 @@ _EDGE_BAR = re.compile(r"^(?:[|\\]\s+)+|(?:\s+[|\\])+$")
 # 없으므로, 양쪽이 한글인 이음매에는 표식만 남기고 책이 다 모인 뒤 resolve_joins가
 # 그 책 자신의 표기로 정한다(외부 사전이 아니라 책이 줄 가운데서 쓴 표기가 증거다).
 JOIN = ""
+
+
+def _squash(text: str) -> str:
+    """공백과 줄바꿈 이음 표식을 모두 뺀다 — 같은 글인지 견줄 때 쓴다."""
+    return re.sub(rf"[\s{JOIN}]+", "", text)
+
+
 _EDGE = re.compile(r"^[^0-9A-Za-z가-힣]+|[^0-9A-Za-z가-힣]+$")
 
 
