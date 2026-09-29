@@ -430,7 +430,13 @@ venv\Scripts\python scripts\정답지_채점.py --rerun  # 정답지 쪽을 현�
 
 | 파일 | 역할 |
 |---|---|
-| `scripts/pdf_ocr.py` | 오케스트레이션 — 레이아웃·본문·수식·표·캡션 조립 |
+| `scripts/pdf_ocr.py` | 오케스트레이션 — 쪽 준비·인식·조립을 겹쳐 흘리고, 책 단위로 확정·이어 쓰기 |
+| `scripts/pdf_layout.py` | 레이아웃 분석 (DocLayout-YOLO) — 모델을 폴더 안에서만 찾고 외부 연결을 막는다 |
+| `scripts/pdf_math.py` | 수식 검출·인식 — MFR 인코더는 iGPU(DirectML), int8 디코더는 CPU에서 교차 실행 |
+| `scripts/pdf_embedded.py` | 내장 텍스트층 — 줄 복원·위첨자 이식 |
+| `scripts/pdf_flow.py` | 영역 분류(색 상자·캡션·수식 번호)·읽기 순서·줄 배정 |
+| `scripts/pdf_markdown.py` | 페이지 → Markdown 조립 (그림 저장·절 표지 헤딩·떨어진 캡션) |
+| `scripts/pdf_pageno.py` | 인쇄 쪽번호 읽기·이웃 대조 확정 |
 | `scripts/pdf_text.py` | Tesseract 계층 (2-PSM 병렬, 단어 좌표 보존) |
 | `scripts/pdf_latex.py` | 수식 LaTeX 정리·호환 변환 |
 | `scripts/pdf_table.py` | 격자 검출과 셀 추출 |
@@ -441,6 +447,7 @@ venv\Scripts\python scripts\정답지_채점.py --rerun  # 정답지 쪽을 현�
 | `scripts/정답지_채점.py` | 원본 쪽 정답지 대조 (문자 일치율 · 낱말 회수율) |
 | `scripts/setup_env.py` | 폴더 안 venv 구성 · 자산 내려받기 · 가속 검증 |
 | `scripts/common.py` | 외부 도구 경로 · 오프라인 가드 |
+| `scripts/mfr_rebuild/` | 수식 인식 모델 재제작 — ONNX 가중치 이식 → KV캐시 포함 재수출 → int8 양자화 |
 | `scripts/tests/test_pure.py` | 순수 함수 골든 테스트 290건 |
 | `설정.toml` / `장구분.example.toml` | 임계값·장 구분 프로파일 (코드 수정 없이 조정) |
 

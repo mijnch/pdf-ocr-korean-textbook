@@ -3,6 +3,11 @@
 입력 폴더의 PDF를 읽어, 페이지마다 레이아웃을 분석해 영역별로 최적의 엔진에
 보내고 읽기 순서대로 정돈된 '원본이름_OCR.md'를 출력 폴더에 저장한다.
 
+이 파일은 흐름(쪽 준비 → 인식 → 조립 → 책 단위 확정)을 맡고, 단계별 판정은 하위 모듈에
+있다 — pdf_embedded(내장 텍스트층), pdf_flow(영역 분류·읽기 순서), pdf_markdown(Markdown
+조립), pdf_pageno(인쇄 쪽번호), pdf_text(Tesseract), pdf_layout·pdf_math·pdf_latex(레이아웃·
+수식), pdf_table(표). 하위 모듈의 이름은 여기서 재수출하므로 pdf_ocr.X로도 부를 수 있다.
+
 영역별 라우팅:
   - 그림/표  → OCR하지 않고 PNG로 저장하고 ![그림] 링크 + 캡션을 바로 아래 병합
   - 수식      → pix2text(MFD/MFR)로 LaTeX 변환 ($$...$$ / $...$, 우측 수식 번호 부착)
@@ -37,11 +42,8 @@ import re
 import sys
 import tempfile
 import time
-from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
-from PIL import Image
 
 import pdf_audit
 import pdf_chapters
@@ -56,7 +58,9 @@ from pdf_latex import (  # noqa: F401
 import pdf_text  # noqa: F401
 from pdf_text import (  # noqa: F401
     HIRES_MAX_DPI,
+    JOIN,
     MASK_MARGIN,
+    _MATH_SPAN,
     MIN_LINE_CONF,
     OCR_MIN_DPI,
     PSM_CANDIDATES,
@@ -66,24 +70,81 @@ from pdf_text import (  # noqa: F401
     SCAN_CELL_MIN_CONF,
     SCAN_CELL_SCALES,
     TESS_LANG,
-    _MATH_SPAN,
     _WATERMARK_RE,
     _WORDISH,
-    JOIN,
     clean_text,
     detect_columns,
     detect_rotation,
+    join_lines,
     load_tesseract_result,
     make_scan_cell_fn,
     merge_rescue_lines,
     native_scan_dpi,
     ocr_region_lines,
     ocr_region_text,
-    join_lines,
     resolve_joins,
+    _squash,
     start_tesseract,
     tesseract_lines,
     vote_lines,
+)
+
+# 쪽 조립 단계별 하위 모듈 — 이름은 여기서 재수출한다(기존 호출부·테스트 호환).
+from pdf_embedded import (  # noqa: F401
+    embedded_lines,
+    graft_superscripts,
+    has_embedded_text,
+    _is_sane_char,
+    _page_char_index,
+    _sup_runs,
+    superscript_marks,
+    superscript_severed,
+    table_superscript_partial,
+)
+from pdf_flow import (  # noqa: F401
+    CALLOUT_COLOR_RATIO,
+    _CALLOUT_JUNK,
+    CALLOUT_REDO_GAIN,
+    _CAPTION_RE,
+    _CAPTION_REF,
+    assemble_region_text,
+    assign_lines,
+    _by_col_then_row,
+    clean_column_bands,
+    colored_ratio,
+    geometric_gutter,
+    infer_column,
+    is_callout,
+    is_caption_like,
+    is_eq_label,
+    order_flow,
+    _overlap_ratio,
+    _row_order,
+    tinted_ratio,
+    _weave_line,
+)
+from pdf_markdown import (  # noqa: F401
+    _accept_table,
+    ai_preamble,
+    attach_orphan_captions,
+    body_chars,
+    has_ink,
+    md_link_path,
+    render_flow,
+    save_figure,
+    split_semantic_heading,
+)
+from pdf_pageno import (  # noqa: F401
+    HEADER_PROBE_RATIOS,
+    _PAGE_HEAD_ANY,
+    confirm_page_numbers,
+    fill_page_numbers,
+    printed_page_number,
+    read_printed_page,
+    rising_page_numbers,
+    settle_page_numbers,
+    settle_pairs,
+    split_repeated_page_numbers,
 )
 
 from common import (
@@ -98,12 +159,6 @@ from common import (
 )
 
 FEATURE = "PDF OCR"
-
-FIG_MARGIN = tuning.get("figure", "margin")        # 그림을 잘라낼 때 사방 여백(픽셀)
-FIG_MAX_PX = tuning.get("figure", "max_px")        # 저장 그림의 최장변 상한
-FIG_COLORS = tuning.get("figure", "colors")        # 양자화 색 수(용량 약 절반)
-MIN_SANE_CHAR_RATIO = tuning.get("layout", "min_sane_char_ratio")  # 정상 글자율 하한
-PARA_JOIN_MARGIN = tuning.get("layout", "para_join_margin")        # 문단 병합 여유
 HEADER_BAND_RATIO = tuning.get("layout", "header_band_ratio")      # 머리말 띠
 # 상단 띠 안에 있어도 이보다 긴 글은 머리말로 보지 않는다 — 상단 여백이 좁은
 # 자료의 첫 줄(장·절 제목)이 매 쪽 잘려 나가는 것을 막는다. 5권 실측 머리말은
@@ -111,7 +166,6 @@ HEADER_BAND_RATIO = tuning.get("layout", "header_band_ratio")      # 머리말 �
 HEADER_MAX_CHARS = 60
 HEADER_EXT_RATIO = tuning.get("layout", "header_ext_ratio")        # 확장 띠(내용 병행)
 FOOT_BAND_RATIO = tuning.get("layout", "foot_band_ratio")          # 내장책 쪽번호 띠
-CAPTION_MAX_CHARS = tuning.get("layout", "caption_max_chars")      # 캡션 최대 길이
 # Tesseract를 MFR과 겹쳐 돌리는 전용 스레드 풀. 고해상 페이지의 두 Tesseract
 # 패스(400dpi 주 + 200dpi 보충)는 서로 의존이 없어 함께 돈다 — 실측 A/B(공학수학1
 # 5쪽): 워커 1→2에서 10.66→8.95초/쪽, 정확도 손실 0. 여기에 다음 쪽의 두 패스가
@@ -121,335 +175,6 @@ TESS_WORKERS = 4
 _TESS_POOL = ThreadPoolExecutor(max_workers=TESS_WORKERS)
 # 다음 페이지의 레이아웃+수식검출을 현재 페이지 MFR과 겹치는 선행 스레드
 _PREFETCH_POOL = ThreadPoolExecutor(max_workers=1)
-
-
-
-# ─────────────────────────── 내장 텍스트 본문 추출 ───────────────────────────
-
-def _is_sane_char(ch: str) -> bool:
-    o = ord(ch)
-    return (
-        ch.isascii()
-        or 0xAC00 <= o <= 0xD7A3   # 한글 음절
-        or 0x3130 <= o <= 0x318F   # 한글 호환 자모
-        or 0x0370 <= o <= 0x03FF   # 그리스 문자 — 물리 본문의 α β γ 줄 보존(검토단)
-        or 0x3000 <= o <= 0x303F   # CJK 문장부호
-        or 0xFF00 <= o <= 0xFFEF   # 전각 영숫자·문장부호
-        or 0x2018 <= o <= 0x201D   # 따옴표
-        or ch in "·…—–"
-    )
-
-
-def has_embedded_text(textpage, min_chars: int = 50) -> bool:
-    """페이지에 쓸 만한 내장 텍스트 레이어가 있는지 검사한다.
-
-    글자 수만이 아니라 정상 글자 비율도 본다 — 과거 타 도구가 입힌 저품질
-    OCR층을 본문으로 신뢰하면 스캔 재인식이 영영 돌지 않으므로, 비율이 낮으면
-    스캔 경로로 넘긴다(검토단 지적. 내장 5권 실측 최저 0.875라 여유가 크다).
-    """
-    n = textpage.count_chars()
-    if n < min_chars:
-        return False
-    text = textpage.get_text_range(0, n)
-    visible = [ch for ch in text if not ch.isspace()]
-    if len(visible) < min_chars:
-        return False
-    sane = sum(1 for ch in visible if _is_sane_char(ch))
-    return sane / len(visible) >= MIN_SANE_CHAR_RATIO
-
-
-# ─── 위첨자 복원(내장 텍스트 전용) ───
-# 내장 텍스트층은 위첨자를 '작은 글꼴의 보통 글자'로만 표현한다 — pdfium의 문자
-# 상자는 세로 위치를 구분해 주지 않으므로(밑수와 지수의 bottom/top이 동일) 유일한
-# 신호는 글꼴 크기다(실측 대학물리 p298: 밑수 10=6.15pt, 지수 10=4.61pt = 75%).
-# 이걸 안 쓰면 '35 × 10^10'이 '35 X 1010'으로 평문화돼 값이 10^7배 틀린다(검토단 C-3).
-# 실측 규모: 표 셀 203건 + 내장 본문 199건.
-_SUP_RATIO = 0.85            # 이 비율 미만이면 작은 글꼴로 본다
-_SUP_CHARS = set("0123456789+-−")
-_SUP_MAX_RUN = 3             # 지수는 짧다(10^-19 등) — 긴 런은 본문 크기 변화다
-# 밑수는 숫자나 닫는 괄호만 인정한다. pdfium은 위/아래 첨자를 구분해 주지 않으므로
-# (문자 상자·원점 모두 밑수와 동일) 문자 밑수는 아래첨자일 확률이 높다 — 실측 표본
-# 241건 분류: 숫자 34%·닫는괄호 10%는 전부 정상(10^{5}, (12 A)^{2}), 소문자 45%·
-# 대문자 11%는 대부분 아래첨자(v_1을 v^{1}로, C_2를 C^{2}로 오인). 과학적 표기의
-# 10^n(값이 10^7배 틀리던 원인)만 확실히 잡고 나머지는 건드리지 않는다.
-_SUP_BASE_OK = set("0123456789)]}")
-# 지수 앞에 이 글자가 큰 글꼴로 놓여 있으면 과학적 표기가 망가진 것이다.
-# 정상이라면 지수의 부호(-)도 작은 글꼴이라 런에 함께 들어온다. 큰 글꼴 부호나
-# 따옴표 글리프가 밑수 자리에 있다는 것은 내장 OCR 층이 '10^-3'을 '10-3'·'10“8'
-# 처럼 부호를 본문 크기로 잘못 새겼다는 뜻이며, 그 셀의 값은 자릿수가 틀린다.
-# 문자 밑수('m2'의 m)는 여기 넣지 않는다 — 정상적인 단위 지수이거나 아래첨자라
-# 오염과 구분되지 않는다(실측: 넣으면 멀쩡한 표 3개가 함께 폐기됐다).
-_SUP_SEVERED_SIGN = set("-−+*\"'`´“”’‘")
-# 숫자를 닮은 글자. 과학적 표기('1.00 X IO3') 안에서 지수의 밑수 자리에 오면
-# 내장 OCR 층이 '10'을 'IO'로 잘못 읽은 것이다 — 곱셈 표시가 같은 셀에 있을
-# 때만 인정한다(그냥 'm2'의 m 같은 정상 단위 지수와 섞이지 않게).
-_SUP_DIGIT_LOOKALIKE = set("OoIlQq")
-_SCI_MULT = re.compile(r"[Xx×]\s*$|[Xx×]\s*\S")
-
-
-def _sup_runs(items: list[tuple[str, float]]) -> list[tuple[int, int, bool]]:
-    """작은 글꼴 런을 찾아 [(시작, 끝, 밑수적합)] 목록으로 돌려준다.
-
-    밑수적합=False는 '글꼴 크기는 위첨자라고 말하는데 앞 글자가 밑수로 쓸 수
-    없다'는 뜻이다 — 정상적인 아래첨자일 수도 있고, 내장 OCR 층이 밑수를
-    문자로 깨뜨린 것일 수도 있다(10을 IO로). 표 폐기 판정이 이 값을 쓴다.
-    """
-    sizes = [s for ch, s in items if s > 1.0 and not ch.isspace()]
-    if len(sizes) < 2:
-        return []
-    base = sorted(sizes)[len(sizes) // 2]
-    if base <= 0:
-        return []
-    small = [i for i, (ch, s) in enumerate(items)
-             if 1.0 < s < base * _SUP_RATIO and ch in _SUP_CHARS]
-    runs, i = [], 0
-    while i < len(small):
-        j = i
-        while j + 1 < len(small) and small[j + 1] == small[j] + 1:
-            j += 1
-        run = small[i:j + 1]
-        i = j + 1
-        if len(run) > _SUP_MAX_RUN:
-            continue
-        # 밑수는 바로 앞에 붙어 있어야 한다 — 사이에 공백이 있으면 위첨자가 아니라
-        # 별개 토큰이다(실측 오탐: '2 X 10 *' → '2 X ^{1}^{0}', 'ka 20' → 'ka ^{20}').
-        prev = items[run[0] - 1][0] if run[0] > 0 else ""
-        runs.append((run[0], run[-1], prev in _SUP_BASE_OK))
-    return runs
-
-
-def superscript_marks(items: list[tuple[str, float]]) -> dict[int, tuple[str, str]]:
-    """(글자, 글꼴크기) 목록에서 위첨자 런을 찾아 {인덱스: (앞, 뒤)} 표식을 만든다.
-
-    인덱스 기반이라 호출부의 글자 순서·삽입 위치 계산을 흐트러뜨리지 않는다.
-    지수 문맥(앞 글자가 숫자·닫는 괄호)일 때만 감싼다 — 각주 번호나
-    글꼴이 섞인 제목이 잘못 위첨자가 되는 것을 막는다.
-    """
-    marks: dict[int, tuple[str, str]] = {}
-    for s, e, ok in _sup_runs(items):
-        if not ok:
-            continue
-        marks[s] = ("^{", "")
-        marks[e] = (marks.get(e, ("", ""))[0], "}")
-        if s == e:
-            marks[s] = ("^{", "}")
-    return marks
-
-
-def graft_superscripts(plain: str, sized: list[tuple[str, float]]) -> str:
-    """이미 잘 띄어쓰기된 텍스트(plain)에 위첨자 표식만 이식한다.
-
-    간격 규칙을 새로 만들면 숫자 안에 헛공백이 생긴다('1 0^{10}') — pdfium이 준
-    plain의 띄어쓰기를 그대로 두고, 같은 순서의 글자 목록(sized)에서 계산한
-    위첨자 표식만 해당 글자 자리에 붙인다. 글자열이 어긋나면 plain을 그대로 쓴다.
-    """
-    marks = superscript_marks(sized)
-    if not marks:
-        return plain
-    seq = [ch for ch, _fs in sized]
-    out, j = [], 0
-    for ch in plain:
-        if ch.isspace():
-            out.append(ch)
-            continue
-        while j < len(seq) and seq[j].isspace():
-            j += 1
-        if j >= len(seq) or seq[j] != ch:
-            return plain                      # 정렬 실패 — 안전하게 원문 유지
-        pre, post = marks.get(j, ("", ""))
-        out.append(pre + ch + post)
-        j += 1
-    return "".join(out)
-
-
-def superscript_severed(plain: str, sized: list[tuple[str, float]]) -> int:
-    """지수의 부호가 본문 글꼴로 떨어져 나간 런의 개수 — 표 폐기 판정에 쓴다.
-
-    내장 텍스트층이 저품질 선행 OCR인 책에서는 '10^-3'이 '10-3'·'10“8'처럼
-    새겨진다: 지수 숫자는 작은 글꼴인데 부호는 본문 크기라서, 위첨자 런의
-    밑수 자리에 부호·따옴표 글리프가 남는다. 그 셀의 값은 자릿수가 틀린다
-    (실측: 대학물리 표 26.2 철 온도계수 5.0×10^-3 → 5.0×10^-8, 10만 배).
-
-    밑수가 숫자 닮은 글자('1.00 X IO3')인 경우도 센다 — 같은 셀에 곱셈
-    표시가 있을 때만이다. 그 밖의 문자 밑수는 세지 않는다: 'm2'의 m처럼
-    정상적인 단위 지수이거나 아래첨자라서 오염과 구분되지 않는다(실측:
-    구분 없이 세면 멀쩡한 표 3개가 함께 폐기됐다).
-
-    본문에는 쓰지 않는다 — 문장은 문맥으로 회복되지만 표의 수치는 회복
-    수단이 없기 때문이다.
-    """
-    n = 0
-    sci = bool(_SCI_MULT.search(plain))
-    for s, _e, ok in _sup_runs(sized):
-        if ok:
-            continue
-        prev = sized[s - 1][0] if s > 0 else ""
-        if prev in _SUP_SEVERED_SIGN or (sci and prev in _SUP_DIGIT_LOOKALIKE):
-            n += 1
-    return n
-
-
-_SCI_RESTORED = re.compile(r"10\^\{")
-_SCI_FLAT = re.compile(r"[Xx×]\s*10[-−]?\d")
-
-
-def table_superscript_partial(md: str) -> bool:
-    """한 표 안에서 지수 복원이 반쪽만 됐는지 — 가장 위험한 형태다.
-
-    셀 단위 신호(글꼴 크기)로는 잡히지 않는 실패가 있다: 글꼴 크기가 지수를
-    아예 표시하지 않으면 포기할 런조차 없어 조용히 평문으로 남는다. 그러나
-    같은 표의 다른 셀이 '10^{24}'로 제대로 복원됐다면, 평문으로 남은
-    'X 1025'는 복원 실패가 확실하다(실측: 대학물리 표 E.2에서 12행 중
-    천왕성 8.68×10^25과 달 7.35×10^22 두 셀만 평문으로 남았다).
-
-    AI는 표의 나머지가 맞으니 그 표를 신뢰하게 되므로, 반쪽 복원은 전부
-    틀린 표보다 오히려 더 위험하다 — 표째로 폐기하고 PNG를 남긴다.
-    """
-    return bool(_SCI_RESTORED.search(md) and _SCI_FLAT.search(md))
-
-
-def char_font_sizes(textpage, n: int) -> list[float]:
-    """문자별 글꼴 크기 목록. API가 없거나 실패하면 빈 목록(기능 비활성)."""
-    try:
-        import pypdfium2.raw as _pr
-
-        return [float(_pr.FPDFText_GetFontSize(textpage.raw, i)) for i in range(n)]
-    except Exception:
-        return []
-
-
-def _page_char_index(textpage):
-    """페이지 전체 글자를 (글자, 글꼴, x0pt, x1pt, ypt)로 한 번만 색인한다.
-
-    표 셀마다 다시 훑지 않도록 페이지당 1회만 만든다(글자 ~1.5천개 수준).
-    좌표는 PDF 포인트 공간이라 get_text_bounded의 인자와 같은 기준이다.
-    """
-    n = textpage.count_chars()
-    sizes = char_font_sizes(textpage, n)
-    if not sizes:
-        return []
-    text = textpage.get_text_range(0, n)
-    if len(text) != n:
-        text = "".join(textpage.get_text_range(i, 1) for i in range(n))
-    out = []
-    for i, ch in enumerate(text):
-        if ch in "\r\n":
-            continue
-        try:
-            l, b, r, t = textpage.get_charbox(i)
-        except Exception:
-            continue
-        out.append((ch, sizes[i], l, r, (b + t) / 2))
-    return out
-
-
-def embedded_lines(page, textpage, formulas: list[dict]) -> tuple[list[dict], list[dict]]:
-    """내장 텍스트를 줄 단위로 추출하고, 문장 속 수식을 제자리에 끼워 넣는다.
-
-    수식 영역 안의 내장 글자(깨진 수식 OCR 잔재)는 버리고, 그 자리에 새로 인식한
-    LaTeX($...$)를 삽입한다. 반환: (본문 줄 목록, 줄에 삽입되지 않고 남은 수식 목록).
-    """
-    scale = RENDER_DPI / 72
-    page_height = page.get_size()[1]
-    n = textpage.count_chars()
-    text = textpage.get_text_range(0, n)
-    if len(text) != n:  # 서러게이트 등으로 인덱스가 어긋나면 글자별로 다시 읽는다
-        text = "".join(textpage.get_text_range(i, 1) for i in range(n))
-
-    embeddings = [f for f in formulas if f["kind"] == "embedding"]
-
-    def char_box(i: int) -> tuple[float, float, float, float]:
-        left, bottom, right, top = textpage.get_charbox(i)
-        return (left * scale, (page_height - top) * scale,
-                right * scale, (page_height - bottom) * scale)
-
-    def hit_formula(cx: float, cy: float):
-        for f in formulas:
-            if f["x0"] <= cx <= f["x1"] and f["y0"] <= cy <= f["y1"]:
-                return f
-        return None
-
-    font_sizes = char_font_sizes(textpage, n)
-
-    lines: list[dict] = []
-    consumed_ids: set[int] = set()
-    chars: list[tuple[str, tuple, bool, float]] = []  # (글자, px 박스, 복원 여부, 글꼴)
-
-    def flush_line() -> None:
-        nonlocal chars
-        # 조사 중복 절제: 수식 박스가 삼킨 조사 '이'를 복원했는데 바로 뒤(공백 없이)
-        # 실제 '이'가 이어지면('이다/이면/이고/이므로'의 첫 글자) 복원분은 군더더기다
-        # ('$수식$이이다' → '$수식$이다'). 실측 45건. 공백이 낀 '이 이론'류는
-        # 사이에 공백 글자가 있어 영향받지 않고, 대상을 '이'+'이'로 한정해 안전하다.
-        chars = [c for j, c in enumerate(chars)
-                 if not (c[2] and c[0] == "이"
-                         and j + 1 < len(chars) and chars[j + 1][0] == "이")]
-        kept = [(ch, box) for ch, box, _, _ in chars]
-        sup_marks = superscript_marks([(ch, fs) for ch, _, _, fs in chars])
-        only_restored = chars and all(restored for _, _, restored, _ in chars)
-        chars = []
-        if not kept or only_restored:
-            return
-        sane = sum(1 for ch, _ in kept if _is_sane_char(ch) and not ch.isspace())
-        visible = sum(1 for ch, _ in kept if not ch.isspace())
-        if visible == 0 or sane / visible < MIN_SANE_CHAR_RATIO:
-            return
-        x0 = min(b[0] for _, b in kept)
-        y0 = min(b[1] for _, b in kept)
-        x1 = max(b[2] for _, b in kept)
-        y1 = max(b[3] for _, b in kept)
-
-        inserts: list[tuple[int, str]] = []
-        for f in sorted(embeddings, key=lambda f: f["x0"]):
-            if id(f) in consumed_ids:
-                continue
-            overlap = min(y1, f["y1"]) - max(y0, f["y0"])
-            if overlap < 0.5 * min(y1 - y0, f["y1"] - f["y0"]):
-                continue
-            tolerance = 0.8 * (f["y1"] - f["y0"])
-            if f["x0"] > x1 + tolerance or f["x1"] < x0 - tolerance:
-                continue
-            idx = next(
-                (k for k, (_, b) in enumerate(kept) if (b[0] + b[2]) / 2 >= f["x0"]),
-                len(kept),
-            )
-            inserts.append((idx, f" ${f['text']}$ "))
-            consumed_ids.add(id(f))
-        pieces: list[str] = []
-        for k, (ch, _) in enumerate(kept):
-            pieces.extend(marker for idx, marker in inserts if idx == k)
-            # 내장 텍스트의 '$'는 이스케이프 — 수식 구분자 $와 짝을 이루면
-            # 본문이 수식으로 렌더링된다(위 marker의 $만 구분자로 남긴다).
-            pre, post = sup_marks.get(k, ("", ""))
-            pieces.append(pre + (r"\$" if ch == "$" else ch) + post)
-        pieces.extend(marker for idx, marker in inserts if idx == len(kept))
-        merged = " ".join("".join(pieces).split())
-        if merged:
-            lines.append({"text": merged, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
-
-    for i, ch in enumerate(text):
-        if ch in "\r\n":
-            flush_line()
-            continue
-        box = char_box(i)
-        cx = (box[0] + box[2]) / 2
-        f = hit_formula(cx, (box[1] + box[3]) / 2)
-        if f is not None:
-            is_trailing_hangul = (
-                f["kind"] == "embedding"
-                and "가" <= ch <= "힣"
-                and cx >= f["x0"] + 0.55 * (f["x1"] - f["x0"])
-            )
-            if not is_trailing_hangul:
-                continue
-            chars.append((ch, box, True, font_sizes[i] if font_sizes else 0.0))
-        else:
-            chars.append((ch, box, False, font_sizes[i] if font_sizes else 0.0))
-    flush_line()
-
-    remaining = [f for f in formulas if id(f) not in consumed_ids]
-    return lines, remaining
-
 
 
 # ─────────────────────────── 본문 안전 정제 ───────────────────────────
@@ -469,125 +194,6 @@ _FOOTNOTE_RE = re.compile(r"^\s*[*＊†‡]")
 
 # 표 캡션 표지('표 5.1 …') — 위쪽 캡션 흡수와 표 추출 트리거가 함께 쓴다.
 _TABLE_CAP_RE = re.compile(r"^표\s*\d")
-
-
-# ─────────────────────────── 영역 분류 ───────────────────────────
-
-CALLOUT_COLOR_RATIO = tuning.get("layout", "callout_color_ratio")  # 색 박스 판정
-# 색 상자 안 글이 '망가진 티'를 내는 표식 — 한글 사이에 낀 3자 이상 영숫자 덩어리.
-# 정상 콜아웃의 'RC'(2자)·'7.9'는 걸리지 않고, 오독 '[ize 2810]'은 걸린다.
-_CALLOUT_JUNK = re.compile(r"[A-Za-z0-9]{3,}")
-CALLOUT_REDO_GAIN = 1.15   # 크롭 재인식이 이만큼 더 많이 읽어야 교체한다
-
-
-def _region_pixels(page_image, region: dict, size: int) -> list:
-    """영역을 size×size로 줄인 RGB 픽셀 목록. 한 픽셀도 안 되는 영역이면 빈 목록.
-
-    고해상 판독의 좌표를 기준 공간으로 나누면 1픽셀 미만 높이의 줄 상자가 생긴다
-    (실측 전자기학 p176) — 그대로 줄이면 PIL이 예외를 내 쪽 전체가 실패한다.
-    상자는 쪽 경계로 자른다: 텍스트층 글자 상자가 망가진 PDF는 줄 좌표가 쪽 밖
-    수만 픽셀로 튀고(실측 강의록: 51억 화소 크롭), PIL이 압축 폭탄으로 보고 막는다.
-    """
-    x0, y0 = max(0, round(region["x0"])), max(0, round(region["y0"]))
-    x1 = min(page_image.width, round(region["x1"]))
-    y1 = min(page_image.height, round(region["y1"]))
-    if x1 - x0 < 1 or y1 - y0 < 1:
-        return []
-    crop = page_image.crop((x0, y0, x1, y1))
-    return list(crop.convert("RGB").resize((size, size)).getdata())
-
-
-def colored_ratio(page_image, region: dict) -> float:
-    """영역 배경의 유색(채도 있는) 픽셀 비율. 흰/검/회색이면 0에 가깝다.
-
-    색칠된 강조·예제 박스(콜아웃)를 일반 본문과 구분하는 데 쓴다.
-    """
-    pix = _region_pixels(page_image, region, 40)
-    colored = sum(1 for r, g, b in pix if max(r, g, b) - min(r, g, b) > 40)
-    return colored / len(pix) if pix else 0.0
-
-
-def tinted_ratio(page_image, region: dict) -> float:
-    """영역 배경이 '밝지만 희지 않은' 픽셀의 비율 — 옅은 색 상자를 가려낸다.
-
-    colored_ratio(채도 40 초과)는 진한 색만 잡는다. 교재의 예제 상자는 아주
-    옅은 하늘색인 경우가 많아 그 문턱을 넘지 못한다(전자회로 p500 상자:
-    채도 기준 3.2%, 이 기준 59.9%). 흰 바탕의 도표는 0~5%다(실측).
-    """
-    pix = _region_pixels(page_image, region, 48)
-    tint = sum(1 for r, g, b in pix
-               if min(r, g, b) > 170 and max(r, g, b) - min(r, g, b) > 6)
-    return tint / len(pix) if pix else 0.0
-
-
-def is_callout(region: dict, page_image) -> bool:
-    """색칠된 강조/예제 박스인지 판정한다(소제목 TITLE 제외).
-
-    실질 글자(한글·영문)가 너무 적은 영역(번호 '25.', 한 글자, 스캔 잡음 등)은
-    콜아웃으로 만들지 않는다 — 색만 보고 '> [참고]'를 지어내는 것을 막는다.
-    """
-    if region.get("type") == "TITLE":
-        return False
-    if len(_WORDISH.findall(region.get("text", ""))) < 4:
-        return False
-    return colored_ratio(page_image, region) > CALLOUT_COLOR_RATIO
-
-
-def is_eq_label(region: dict, page_w: int) -> bool:
-    """영역이 우측 여백의 수식 번호('(2-33)' 등)인지 판정한다."""
-    width = region["x1"] - region["x0"]
-    center = (region["x0"] + region["x1"]) / 2
-    return width < 0.15 * page_w and center > 0.78 * page_w
-
-
-def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
-    """두 구간의 겹침을 짧은 쪽 길이로 나눈 비율."""
-    inter = max(0.0, min(a1, b1) - max(a0, b0))
-    return inter / max(1.0, min(a1 - a0, b1 - b0))
-
-
-# 그림 캡션 표지(이 말로 시작하면 캡션으로 본다). OCR 변형('그럼')도 포함.
-_CAPTION_RE = re.compile(r"^\s*(?:그림|그럼|\[?그림|표|Fig\.?|Figure|Table|사진|도표)\b", re.I)
-# 문제 번호·항목 표지로 시작하는 글(연습문제 본문) — 캡션이 아니다.
-_PROBLEM_RE = re.compile(r"^\s*(?:\d+\.\d+|\d+\s|\[\d|[□O◯▸•])")
-# 캡션 '라벨'로 시작하는 글: 표지 + 번호로 시작하고 번호 뒤에 조사가 붙지 않는다.
-# '그림 1.28 문제 1.17.'은 라벨이지만 '그림 1.28은 5개의 소자를…'은 본문 참조다 —
-# 이 경계가 없으면 본문 문장이 캡션으로 둔갑한다(실측: p53의 문제 1.17 문장).
-# 라벨로 시작하는 글에만 넓은 캡션 띠를 허용한다.
-_CAPTION_REF = re.compile(
-    r"^\s*(?:그림|그럼|기림|표|Fig\.?|Figure|Table|사진|도표)"
-    r"\s*[0-9]+[.．\-][0-9]+[가-힣]", re.I)
-# 완결된 한국어 문장의 끝 — 표지 없는 글이 이렇게 끝나면 본문이다.
-_SENTENCE_END = re.compile(r"(?:다|라|자|요|오)[.。]\s*$|[?？]\s*$")
-_HANGUL_CH = re.compile(r"[가-힣]")
-
-
-def is_caption_like(text: str) -> bool:
-    """캡션 조각인지 판정한다.
-
-    - 캡션 표지(그림/표/Fig…)로 시작하면 길이 무관 캡션.
-    - 문제 번호(4.18 등)·항목 표지로 시작하면 본문이므로 캡션 아님.
-    - 표지가 없으면 짧은 설명 조각(≤45자)만 캡션으로 보되, 완결된 문장은
-      제외한다 — 예제 문제 문장이 캡션으로 둔갑하던 경로다(실측: 대학물리
-      p55에서 '전투기가 63 m/s의 속력으로 항공모함에 착륙하려고 한다.'가
-      그림 2.11의 캡션이 되어, 그림 2.11을 물으면 엉뚱한 답이 나왔다).
-      표지가 붙은 캡션은 문장으로 끝나도 그대로 둔다 — 원본 캡션이 실제로
-      '…잴 수 있다.'처럼 문장인 경우가 많다.
-    """
-    t = text.strip()
-    if not t:
-        return False
-    if _CAPTION_RE.match(t):
-        return True
-    if _PROBLEM_RE.match(t):
-        return False
-    if _SENTENCE_END.search(t):
-        return False
-    # 표지도 없고 한글도 거의 없는 조각은 OCR 잡음이다('^ 1.18.', '.18 1.29에서').
-    # 캡션으로 삼으면 그 그림의 진짜 캡션 회수까지 막는다(실측 p53).
-    if len(_HANGUL_CH.findall(t)) < 2:
-        return False
-    return len(t) <= CAPTION_MAX_CHARS
 
 
 _AGREE_TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z]{3,}")
@@ -647,789 +253,7 @@ def embedded_layer_agreement(pdf, tmp_dir: Path,
     return statistics.median(vals) if len(vals) >= 3 else None
 
 
-GUTTER_LO, GUTTER_HI = 0.25, 0.75   # 거터가 있을 수 있는 x 구간(페이지 폭 대비)
-GUTTER_PAD = 0.015                  # 이만큼은 걸쳐도 '가로지른다'고 보지 않는다
-GUTTER_MIN_SIDE = 2                 # 양쪽에 각각 이만큼의 영역이 있어야 한다
-GUTTER_MIN_WIDTH = 0.15             # 양쪽 덩어리가 각각 이만큼은 넓어야 한다
-
-
-def geometric_gutter(regions: list[dict], page_w: int) -> float | None:
-    """좌표만 보고 칼럼 경계를 찾는다 — 라벨을 전혀 쓰지 않는다.
-
-    조건: 그 x를 가로지르는 본문 영역이 하나도 없고, 양쪽에 영역이 둘 이상,
-    양쪽 덩어리가 각각 페이지 폭의 15% 이상. 후보가 여럿이면 양쪽 개수가
-    가장 고르게 갈리는 x를 고른다.
-
-    단일 칼럼 페이지에서는 본문 문단이 어느 x든 가로지르므로 자연히 None이
-    나온다(실측: 8권 표본 16쪽 중 단단 12쪽 전부 None). 여백 주석·그림
-    칼럼이 있는 쪽에서만 경계가 잡힌다 — 대학물리 p647 x=458,
-    전기회로이론 p314 x=409, 전자회로 p293 x=830.
-    """
-    texts = [r for r in regions if r.get("kind", "text") == "text"] or regions
-    if len(texts) < 2 * GUTTER_MIN_SIDE:
-        return None
-    pad = GUTTER_PAD * page_w
-    best: tuple[int, float] | None = None
-    for x in range(int(GUTTER_LO * page_w), int(GUTTER_HI * page_w), 4):
-        if any(r["x0"] + pad < x < r["x1"] - pad for r in texts):
-            continue
-        left = [r for r in texts if (r["x0"] + r["x1"]) / 2 < x]
-        right = [r for r in texts if (r["x0"] + r["x1"]) / 2 >= x]
-        if len(left) < GUTTER_MIN_SIDE or len(right) < GUTTER_MIN_SIDE:
-            continue
-        lw = max(r["x1"] for r in left) - min(r["x0"] for r in left)
-        rw = max(r["x1"] for r in right) - min(r["x0"] for r in right)
-        if lw < GUTTER_MIN_WIDTH * page_w or rw < GUTTER_MIN_WIDTH * page_w:
-            continue
-        bal = min(len(left), len(right))
-        if best is None or bal > best[0]:
-            best = (bal, float(x))
-    return best[1] if best else None
-
-
-def clean_column_bands(regions: list[dict], page_w: int) -> dict[int, tuple[float, float]]:
-    """칼럼별 x 범위 — 단, 제 칼럼 중앙값에서 크게 벗어난 영역은 빼고 구한다.
-
-    레이아웃 모델이 오른쪽 단의 문단에 왼쪽 칼럼 번호를 붙이는 일이 있다.
-    그 한 영역 때문에 밴드가 페이지를 뒤덮으면 거터가 사라져 읽기 순서가
-    행 단위로 무너진다. 판정 기준은 pdf_text.detect_columns와 같은 값을 쓴다.
-    """
-    import statistics
-
-    cols: dict[int, list[dict]] = {}
-    for r in regions:
-        c = r.get("col", 1)
-        if c >= 1:
-            cols.setdefault(c, []).append(r)
-    bands: dict[int, tuple[float, float]] = {}
-    for c, rs in cols.items():
-        med = statistics.median((r["x0"] + r["x1"]) / 2 for r in rs)
-        keep = [r for r in rs
-                if abs((r["x0"] + r["x1"]) / 2 - med)
-                <= pdf_text.COL_OUTLIER_RATIO * page_w] or rs
-        bands[c] = (min(r["x0"] for r in keep), max(r["x1"] for r in keep))
-    return bands
-
-
-def infer_column(cx: float, bands: dict[int, tuple[float, float]]) -> int:
-    """중심 x좌표가 속하는 칼럼 번호를 추정한다(레이아웃에 없는 수식용)."""
-    if not bands:
-        return 1
-    inside = [c for c, (x0, x1) in bands.items() if x0 <= cx <= x1]
-    if inside:
-        return min(inside)
-    # 어느 칼럼에도 안 들어가면 중심이 가장 가까운 칼럼
-    return min(bands, key=lambda c: abs(cx - (bands[c][0] + bands[c][1]) / 2))
-
-
-def _row_order(blocks: list[dict]) -> list[dict]:
-    """세로로 겹치는 블록들을 한 행으로 묶고 행 안에서 좌→우로 읽는다.
-
-    y0만으로 정렬하면 같은 줄에 나란히 놓인 두 항목(공식표의 좌·우 항, 나란한
-    그림 등)이 몇 픽셀 y 차이로 뒤바뀐다 — 실측: 대학수학 표 5.4가
-    (2)(1)(4)(3) 순으로 나왔다. 세로 범위가 겹치지 않는 통상 문단은 각자
-    한 행이 되어 순서가 그대로 유지된다.
-    """
-    items = sorted(blocks, key=lambda b: (b["y0"] + b.get("y1", b["y0"])) / 2)
-    rows: list[list[dict]] = []
-    for it in items:
-        cy = (it["y0"] + it.get("y1", it["y0"])) / 2
-        if rows:
-            ry0 = min(x["y0"] for x in rows[-1])
-            ry1 = max(x.get("y1", x["y0"]) for x in rows[-1])
-            if ry0 <= cy <= ry1:      # 앞 행과 세로로 겹치면 같은 행
-                rows[-1].append(it)
-                continue
-        rows.append([it])
-    out: list[dict] = []
-    for row in rows:
-        row.sort(key=lambda b: b["x0"])
-        out.extend(row)
-    return out
-
-
-def _by_col_then_row(blocks: list[dict]) -> list[dict]:
-    """칼럼 번호 순으로 묶고, 각 칼럼 안에서는 행 단위 좌→우로 읽는다."""
-    out: list[dict] = []
-    for col in sorted({b["col"] for b in blocks}):
-        out.extend(_row_order([b for b in blocks if b["col"] == col]))
-    return out
-
-
-def order_flow(flow: list[dict], layout_texts: list[dict], page_w: int) -> list[dict]:
-    """읽기 순서 결정: 기하학적 칼럼 정규화 + 세그먼트별 좌→우 읽기.
-
-    DocYolo의 col 라벨은 본문·여백이 섞인 혼합 폭 페이지에서 자의적일 수 있어
-    (예: 예제 블록 둘이 서로 다른 칼럼 번호를 받아 순서가 뒤바뀜) 그대로 믿지
-    않는다. 라벨은 거터(칼럼 사이 경계 x) 추정에만 쓰고, 각 블록의 소속
-    (좌/우/전폭)은 좌표로 재판정한다. 전폭 블록은 세로 구분자가 되어 페이지를
-    세그먼트로 나누고, 세그먼트 안에서만 좌단을 다 읽은 뒤 우단을 읽는다.
-    진짜 2단 페이지는 전폭 블록이 없어 기존(칼럼→y) 순서가 그대로 유지되고,
-    단일 칼럼 페이지는 거터가 없어 순수 위→아래가 된다.
-    """
-    # 밴드는 '제 칼럼에서 멀리 떨어진 오라벨 영역'을 뺀 뒤 구한다 — 그러지 않으면
-    # 오른쪽 문단 하나에 왼쪽 칼럼 번호가 붙은 것만으로 밴드가 페이지를 뒤덮어
-    # 거터가 사라지고, 2단 페이지가 행 단위 좌→우로 읽혀 좌·우 문제가 번갈아
-    # 나온다(실측 전자회로 p293: 5.48→5.52→5.49→5.53 순).
-    bands = sorted(clean_column_bands(layout_texts, page_w).values())
-    gutter = geometric_gutter(layout_texts, page_w)
-    if gutter is None and len(bands) == 2 and bands[1][0] - bands[0][1] > -0.05 * page_w:
-        cand = (bands[0][1] + bands[1][0]) / 2
-        # 라벨에서 나온 거터는 페이지 한가운데 언저리일 때만 받는다. 수식 번호
-        # 라벨 두어 개가 오른쪽 끝에서 제 칼럼 번호를 받으면 거터가 폭의 89%
-        # 지점에 잡히고(실측 대학물리 p647: x=1494/1674), 그러면 페이지 전체가
-        # 한 칼럼이 되어 행 단위로 읽힌다 — 왼쪽 여백 상자가 본문 문단 사이로
-        # 끼어드는 원인이다. 기하 판정이 같은 쪽에서 x=458을 정확히 찾는다.
-        if GUTTER_LO * page_w <= cand <= GUTTER_HI * page_w:
-            gutter = cand
-    if gutter is None:
-        if len(bands) >= 3:  # 3단 이상(희귀): 라벨 순서를 그대로 신뢰
-            for b in flow:
-                if b["col"] < 1:
-                    b["col"] = 0
-            return _by_col_then_row(flow)
-        return _row_order(flow)
-
-    wide = 0.12 * page_w
-    for b in flow:
-        if b["col"] < 1:                       # 머리말 라벨 → 위치(y) 그대로 배치
-            b["col"] = 0
-        elif gutter - b["x0"] > wide and b["x1"] - gutter > wide:
-            b["col"] = 0                       # 전폭 블록 → 세로 구분자
-        else:
-            b["col"] = 1 if (b["x0"] + b["x1"]) / 2 < gutter else 2
-
-    ordered: list[dict] = []
-    seg: list[dict] = []
-
-    def flush_seg():
-        ordered.extend(_by_col_then_row(seg))
-        seg.clear()
-
-    for b in sorted(flow, key=lambda b: b["y0"]):
-        if b["col"] == 0:
-            flush_seg()
-            ordered.append(b)
-        else:
-            seg.append(b)
-    flush_seg()
-    return ordered
-
-
-# ─────────────────────────── 줄 → 영역 배정 ───────────────────────────
-
-def assign_lines(lines: list[dict], regions: list[dict]) -> None:
-    """각 본문 줄을 중심점이 들어가는 텍스트 영역에 배정한다(region['lines']).
-
-    어떤 영역에도 안 들어가는 줄은 자기 자신을 영역으로 갖는 떠돌이 줄이 되어
-    누락되지 않는다(반환 목록에 추가).
-    """
-    for r in regions:
-        r.setdefault("lines", [])
-    for ln in lines:
-        cx = (ln["x0"] + ln["x1"]) / 2
-        cy = (ln["y0"] + ln["y1"]) / 2
-        for r in regions:
-            if r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]:
-                r["lines"].append(ln)
-                break
-        else:
-            regions.append({  # 떠돌이 줄 → 1줄짜리 본문 영역
-                "kind": "text", "type": "STRAY",
-                "x0": ln["x0"], "y0": ln["y0"], "x1": ln["x1"], "y1": ln["y1"],
-                "lines": [ln],
-            })
-
-
-# 마스킹된 인라인 수식 자리에 Tesseract가 남기는 큰 공백 틈(내부 3칸 이상).
-_MASK_GAP = re.compile(r"(?<=\S)\s{3,}(?=\S)")
-
-
-def _insert_at(text: str, cuts: list[tuple[int, str]]) -> str:
-    """text의 (문자 인덱스, 삽입 문자열) 목록을 왼쪽부터 반영해 합친다."""
-    out, prev = [], 0
-    for idx, s in sorted(cuts):
-        idx = max(prev, min(idx, len(text)))
-        seg = text[prev:idx].strip()
-        if seg:
-            out.append(seg)
-        out.append(s)
-        prev = idx
-    tail = text[prev:].strip()
-    if tail:
-        out.append(tail)
-    return " ".join(out).strip()
-
-
-def _weave_by_words(text: str, words: list, formulas: list[dict]) -> str | None:
-    """단어별 x좌표로 수식의 삽입 지점을 계산한다. 못 하면 None.
-
-    words는 [(단어 글자수, x0, x1)]. 수식 왼쪽에 완전히 놓인 단어들의 글자 수를
-    세면 그 수식이 줄의 몇 번째 글자 뒤에 오는지 알 수 있다. tsv 단어 글자 총합과
-    txt 글자 수가 다를 수 있으므로(같은 줄의 다른 판독) 비율로 환산한다.
-    """
-    words = [w for w in words if w[0] > 0]
-    if not words:
-        return None
-    total = sum(n for n, _a, _b in words)
-    stripped = _squash(text)
-    if total <= 0 or not stripped:
-        return None
-    cuts: list[tuple[int, str]] = []
-    for f in formulas:
-        fx = f["x0"]
-        # 수식보다 확실히 왼쪽에서 끝나는 단어들의 글자 수(경계가 겹치면 중심으로 판정)
-        n_left = sum(n for n, a, b in words if b <= fx or (a < fx and (a + b) / 2 < fx))
-        n_scaled = round(n_left * len(stripped) / total)
-        # 공백 제외 n_scaled번째 글자 뒤의 원문 인덱스를 찾는다
-        seen, idx = 0, len(text)
-        for i, ch in enumerate(text):
-            if seen >= n_scaled:
-                idx = i
-                break
-            if not ch.isspace():
-                seen += 1
-        # tsv 글자 수와 txt 글자 수가 다르면(같은 줄의 다른 판독) 위 환산에 ±몇 글자
-        # 오차가 생겨 낱말 중간을 가를 수 있다 — 가까운 공백으로 스냅해 낱말 경계에
-        # 넣는다(마스킹 틈은 공백이므로 대개 정확히 그 자리로 붙는다).
-        best, bestd = idx, None
-        for j in range(max(0, idx - 4), min(len(text), idx + 5)):
-            if text[j].isspace():
-                d = abs(j - idx)
-                if bestd is None or d < bestd:
-                    best, bestd = j, d
-        cuts.append((best, f"${f['text']}$"))
-    return _insert_at(text, cuts)
-
-
-def _weave_line(text: str, formulas: list[dict], words: list | None = None) -> str:
-    """한 본문 줄에 인라인 수식을 제자리로 끼워 넣는다.
-
-    1순위 — 단어 좌표(tsv): 수식 x가 어느 단어들 뒤인지 세어 정확한 지점에 넣는다.
-    2순위 — 마스킹 공백 틈: 수식 영역은 OCR 전에 흰색으로 가려져 줄에 큰 공백 틈이
-      남는다. 틈 수가 수식 수와 같으면 왼→오로 채운다(단어 좌표가 없는 보충 줄 등).
-    3순위 — 줄 끝에 붙임(안전 폴백).
-    검토단 C-4: 이 처리 전에는 수식이 전부 줄 끝으로 밀려 문장이 조사만 남았다.
-    """
-    fs_sorted = sorted(formulas, key=lambda f: f["x0"])
-    fstr = [f"${f['text']}$" for f in fs_sorted]
-    if words:
-        woven = _weave_by_words(text, words, fs_sorted)
-        if woven:
-            return woven
-    gaps = list(_MASK_GAP.finditer(text))
-    if len(gaps) == len(fstr):
-        return _insert_at(text, [(m.start(), s) for m, s in zip(gaps, fstr)])
-    return " ".join([text] + fstr).strip()
-
-
-def assemble_region_text(region: dict, embeddings: list[dict],
-                         consumed: set[int] | None = None) -> str:
-    """영역에 배정된 본문 줄과 (스캔 경로의) 문장 속 수식을 읽기 순서로 합친다.
-
-    영역 안에서만 행(y) 묶음 + 가로(x) 정렬을 하므로, 페이지 전체를 한꺼번에
-    정렬할 때 생기던 읽기 순서 뒤섞임이 없다. embeddings는 스캔 경로에서만
-    채워지며(내장 경로는 줄에 이미 인라인으로 들어 있음) 영역 안에 중심이
-    들어오는 수식을 다룬다. 수식이 어느 본문 줄에 y로 겹치고 그 줄의 x범위 안에
-    있으면 그 줄의 제자리(_weave_line)에 끼워 넣고, 아니면 독립 항목으로 둔다.
-    consumed에 삽입된 수식의 id를 기록해 겹치는 영역 중복 삽입을 막는다.
-    """
-    lines: list[dict] = [dict(ln) for ln in region.get("lines", [])]
-    region_fs: list[dict] = []
-    for f in embeddings:
-        if consumed is not None and id(f) in consumed:
-            continue
-        cx = (f["x0"] + f["x1"]) / 2
-        cy = (f["y0"] + f["y1"]) / 2
-        if region["x0"] <= cx <= region["x1"] and region["y0"] <= cy <= region["y1"]:
-            region_fs.append(f)
-            if consumed is not None:
-                consumed.add(id(f))
-
-    # 각 수식을 host 본문 줄(y 겹침 + x범위 내)에 배정한다. host가 없으면 독립 항목.
-    hosted: dict[int, list[dict]] = {id(l): [] for l in lines}
-    items: list[dict] = list(lines)
-    for f in region_fs:
-        fcx = (f["x0"] + f["x1"]) / 2
-        fcy = (f["y0"] + f["y1"]) / 2
-        host = None
-        for l in lines:
-            if l["y0"] <= fcy <= l["y1"] and l["x0"] <= fcx <= l["x1"]:
-                if host is None or (l["y1"] - l["y0"]) < (host["y1"] - host["y0"]):
-                    host = l
-        if host is not None:
-            hosted[id(host)].append(f)
-        else:
-            items.append({**f, "text": f"${f['text']}$"})   # 독립 위치
-    for l in lines:
-        if hosted[id(l)]:
-            l["text"] = _weave_line(l["text"], hosted[id(l)], l.get("words"))
-
-    if not items:
-        return ""
-
-    items.sort(key=lambda it: (it["y0"] + it["y1"]) / 2)
-    rows: list[list[dict]] = []
-    for it in items:
-        if rows:
-            ry0 = min(x["y0"] for x in rows[-1])
-            ry1 = max(x["y1"] for x in rows[-1])
-            if ry0 <= (it["y0"] + it["y1"]) / 2 <= ry1:  # 세로로 겹치면 같은 행
-                rows[-1].append(it)
-                continue
-        rows.append([it])
-
-    out = []
-    for row in rows:
-        row.sort(key=lambda it: it["x0"])
-        out.append(" ".join(it["text"] for it in row))
-    return clean_text(join_lines(out))
-
-
-# ─────────────────────────── 페이지 → Markdown ───────────────────────────
-
-def md_link_path(path: str) -> str:
-    """Markdown 링크에 넣어도 안전한 경로 표기로 만든다.
-
-    CommonMark는 ![](...)의 경로를 (a) 닫는 괄호 ')'와 (b) 공백 양쪽에서 끊는다.
-    책 이름에 공백/괄호가 있으면(예: '대학물리 교재_OCR_images/…', 재실행 '(1)')
-    링크가 그 자리에서 끊겨 이미지가 렌더되지 않는다(검토단 실측: 공백만으로
-    2,349개 링크가 깨져 있었다). 둘 중 하나라도 있으면 각괄호 <...>로 감싼다 —
-    <> 안에서는 공백·괄호가 모두 목적지의 일부로 인정된다.
-    """
-    return f"<{path}>" if re.search(r"[()\s]", path) else path
-
-
-def save_figure(page_image, region: dict, images_dir: Path, page_no: int, idx: int,
-                k: float = 1.0) -> str:
-    """그림 영역을 PNG로 저장하고 MD에 넣을 상대 경로를 반환한다.
-
-    page_image가 고해상 이미지면 k(고해상/기준 배율)로 좌표를 환산해 자른다.
-    """
-    images_dir.mkdir(parents=True, exist_ok=True)
-    x0 = max(0, round(region["x0"] * k) - FIG_MARGIN)
-    y0 = max(0, round(region["y0"] * k) - FIG_MARGIN)
-    x1 = min(page_image.width, round(region["x1"] * k) + FIG_MARGIN)
-    y1 = min(page_image.height, round(region["y1"] * k) + FIG_MARGIN)
-    name = f"p{page_no}_fig{idx}.png"
-    crop = page_image.crop((x0, y0, x1, y1))
-    if max(crop.size) > FIG_MAX_PX:
-        r = FIG_MAX_PX / max(crop.size)
-        crop = crop.resize((round(crop.width * r), round(crop.height * r)),
-                           Image.LANCZOS)
-    if crop.mode != "P":
-        crop = crop.convert("RGB").quantize(
-            colors=FIG_COLORS, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG)
-    crop.save(images_dir / name, optimize=True)
-    return md_link_path(f"{images_dir.name}/{name}")
-
-
-def _accept_table(t_md: str | None) -> str:
-    """추출된 MD 표의 최종 위생 게이트. 통과하면 표를, 아니면 빈 문자열을 돌려준다.
-
-    정상 글자율이 낮거나(수식 셀의 깨진 텍스트) 한자·전각 잡음이 있으면 버린다.
-    """
-    if not t_md:
-        return ""
-    vis = [c for c in t_md if not c.isspace() and c not in "|-\\"]
-    sane = sum(1 for c in vis if _is_sane_char(c)) / len(vis) if vis else 0
-    junk = sum(1 for c in t_md if "一" <= c <= "鿿" or c in "（）☆□◇◎")
-    return t_md if (sane >= 0.8 and junk == 0) else ""
-
-
-# ─── 의미론적 절 헤딩(예제·정리·풀이…) ───
-# 페이지 앵커('## N페이지')만으로는 AI가 '예제 3-1을 보여 줘' 같은 요청에서 절의
-# 시작·끝을 알 수 없다(MinerU 비교에서 확인된 유일한 실질 열세). 본문 블록이 절
-# 표지로 시작하면 '### 표지'로 승격하고 나머지는 본문으로 남긴다.
-#
-# 오탐 차단은 실측 기반이다(5권 산출물 조사):
-#   - 표지어가 낱말의 일부인 경우: '정의역', '정의구간', '문제를', '예제와', '참고문언'
-#     → 표지어 바로 뒤에 한글이 오면 표지가 아니다.
-#   - 참조 문장: '퀴즈 7.8에서 본 것처럼' → 번호 바로 뒤에 한글이 오면 표지가 아니다.
-#   - 색인·목록 줄: '연습문제 2.7, 공기 교체 연습문제 2.9, …' → 같은 표지어가 두 번
-#     이상 나오면 목록이다.
-_SEM_WORDS = (
-    "예\\s?제", "연습\\s?문제", "복습\\s?문제", "문\\s?제", "풀\\s?이", "해\\s?답",
-    "증\\s?명", "따름\\s?정리", "보조\\s?정리", "정\\s?리", "정\\s?의", "참\\s?고",
-    "퀴\\s?즈", "요\\s?약", "예\\s?시", "보\\s?기",
-    "Example", "Theorem", "Problem", "Definition", "Solution", "Proof",
-)
-# 번호 없이도 절 표지로 인정하는 말(관행적으로 단독 표제로 쓰인다).
-_SEM_STANDALONE = {"예제", "연습문제", "복습문제", "문제", "풀이", "해답", "증명",
-                   "참고", "요약", "퀴즈", "Solution", "Proof", "Problem"}
-_SEM_HEAD = re.compile(
-    r"^\s*(" + "|".join(_SEM_WORDS) + r")(?![가-힣])"
-    # 번호는 통째로만 인정한다 — 뒤에 숫자·구두점·한글이 이어지면 매칭 실패시켜
-    # '퀴즈 7.8에서'가 '퀴즈 7'로 잘려 표지가 되는 것을 막는다(부분 매칭 차단).
-    r"(?:\s*([0-9]+(?:\s?[.\-]\s?[0-9]+)*)(?![0-9.\-가-힣]))?"
-    r"\s*[:：._\-]?\s*")
-# 표제 뒤 짧은 제목까지 헤딩에 포함할 최대 길이(그 이상은 본문으로 남긴다).
-_SEM_TITLE_MAX = 30
-_SEM_SENT_END = re.compile(r"(?:다|요|까|음|함)[.?!]\s*$|[.?!]\s*$")
-
-
-def split_semantic_heading(text: str) -> tuple[str | None, str]:
-    """본문 블록이 절 표지로 시작하면 (헤딩, 나머지 본문)을, 아니면 (None, 원문)."""
-    m = _SEM_HEAD.match(text)
-    if not m:
-        return None, text
-    word = _squash(m.group(1))
-    num = _squash(m.group(2) or "")
-    rest = text[m.end():].strip()
-    # 같은 표지어가 뒤에 또 나오면 색인·목록 줄이다(헤딩 아님)
-    if _squash(rest).count(word) >= 1:
-        return None, text
-    # 번호가 안 붙었는데 뒤가 숫자로 시작하면 번호 매칭이 실패한 참조 문장이다
-    # ('퀴즈 7.8에서 …') — 표지로 보지 않는다.
-    if not num and rest[:1].isdigit():
-        return None, text
-    if not num and word not in _SEM_STANDALONE:
-        return None, text            # '정의 …', '정리 …'는 번호가 있어야 표지로 본다
-    head = f"{word} {num}".strip()
-    # 표지 뒤 짧은 제목은 헤딩에 붙인다('정리 1.2.1 유일한 해의 존재')
-    if rest and len(rest) <= _SEM_TITLE_MAX and not _SEM_SENT_END.search(rest):
-        head = f"{head} {rest}".strip()
-        rest = ""
-    # 스캔 잔재 구분자(밑줄·콜론 등)가 헤딩 꼬리에 남지 않게 한다('예제 2-10 _')
-    return head.rstrip(" _:：.-").strip(), rest
-
-
-def render_flow(flow: list[dict], page_w: int) -> list[str]:
-    """읽기 순서로 정렬된 블록들을 Markdown 줄 목록으로 만든다.
-
-    - text   : 연속한 본문 블록은 양끝맞춤 여부로 한 문단으로 병합
-    - callout: 색칠된 강조/예제 박스 → > [참고] 인용 블록(원래 위치 유지)
-    - image  : ![그림](경로) + 바로 아래에 그림 캡션
-    - formula: $$ ... $$ (+ 수식 번호)
-    """
-    # 칼럼별 본문 우측 끝(문단 병합 판정용). 다단이면 칼럼마다 폭이 다르다.
-    col_right: dict[int, float] = {}
-    for b in flow:
-        if b["btype"] == "text":
-            c = b.get("col", 1)
-            col_right[c] = max(col_right.get(c, 0), b["x1"])
-
-    md: list[str] = []
-    paragraph = ""
-    cur_col = None
-
-    def flush_para():
-        nonlocal paragraph
-        if paragraph:
-            md.extend([paragraph, ""])
-            paragraph = ""
-
-    for b in flow:
-        if b.get("col") != cur_col:  # 칼럼이 바뀌면 문단 끊기
-            flush_para()
-            cur_col = b.get("col")
-        if b["btype"] == "text":
-            body = b["text"]
-            head, rest = split_semantic_heading(body)
-            if head:                       # 절 표지 → '### 헤딩'으로 승격
-                flush_para()
-                md.extend([f"### {head}", ""])
-                if not rest:
-                    continue
-                body = rest
-            paragraph = join_lines([paragraph, body])
-            join_limit = col_right.get(b.get("col", 1), page_w) - PARA_JOIN_MARGIN
-            if b["x1"] < join_limit:  # 우측 끝에 못 미치면 문단 끝
-                flush_para()
-            continue
-        flush_para()
-        if b["btype"] == "callout":
-            md.extend([f"> [참고] {b['text']}", ""])
-        elif b["btype"] == "image":
-            md.append(f"![{b['caption']}]({b['path']})")
-            if b.get("caption_text"):
-                md.extend(["", f"*{b['caption_text']}*"])
-            if b.get("table_md"):  # 표 구조가 추출된 경우 그림 아래에 병기
-                md.extend(["", *b["table_md"].splitlines()])
-            md.append("")
-        else:  # formula
-            label = f"  {b['label']}" if b.get("label") else ""
-            md.extend([f"$$ {b['text']} $${label}", ""])
-    flush_para()
-    return attach_orphan_captions(md)
-
-
-# 그림 링크 뒤에 평문으로 떨어진 캡션 표지. 번호 뒤에 한글이 이어지면
-# ('그림 1.2에서 …') 캡션이 아니라 본문 참조이므로 배제한다 — 이 경계가
-# 없으면 5권에서 49건의 본문 문단을 캡션으로 잘못 삼킨다(실측).
-_ORPHAN_CAP = re.compile(
-    r"^(?:그림|그럼|기림|표|Fig(?:ure)?\.?|Table)\s*[0-9]+[.．][0-9]+(?![0-9가-힣])")
-# 캡션이 두 줄로 쪼개졌을 때의 뒷줄('문제 1.17.'). 문장은 받지 않는다.
-_ORPHAN_CONT = re.compile(r"^(?:문제|복습문제|예제|연습문제)\s*[0-9]+[.．][0-9]+\.?$")
-# 실측상 진짜 캡션 첫 줄의 90%가 19자 이하 — 60자를 넘으면 본문으로 본다.
-_ORPHAN_MAX = 60
-# 캡션일 수 없는 줄머리(헤딩·다른 그림·블록수식·인용·표)
-_ORPHAN_STOP = ("#", "![", "$$", ">", "|", "*")
-
-
-def attach_orphan_captions(md: list[str]) -> list[str]:
-    """그림 링크 바로 뒤에 평문으로 남은 캡션을 캡션(*…*)으로 흡수한다.
-
-    render_flow의 기하 매칭은 캡션이 '그림 1.28' + '문제 1.17.' 처럼 두 줄로
-    쪼개지거나 그림과 가로로 어긋나면 놓친다(5권 실측 696건, 대부분 전기회로
-    이론의 연습문제면). 이미 캡션이 붙은 그림은 건드리지 않고, 한 캡션을 두
-    그림이 나눠 갖지도 않는다(먼저 만난 그림이 가져간다). 두 번 적용해도
-    결과가 같다.
-    """
-    out: list[str] = []
-    i, n = 0, len(md)
-    while i < n:
-        line = md[i]
-        out.append(line)
-        if not line.startswith("!["):
-            i += 1
-            continue
-        nonblank = [j for j in range(i + 1, n) if md[j].strip()][:2]
-        if nonblank and md[nonblank[0]].lstrip().startswith("*"):
-            i += 1                                  # 이미 캡션이 있다
-            continue
-        take: list[int] = []
-        for k, j in enumerate(nonblank):
-            s = md[j].strip()
-            if s.startswith(_ORPHAN_STOP):
-                break
-            if k == 0:
-                if not (_ORPHAN_CAP.match(s) and len(s) <= _ORPHAN_MAX):
-                    break
-            elif not _ORPHAN_CONT.match(s):
-                break
-            take.append(j)
-        if not take:
-            i += 1
-            continue
-        out.extend(["", "*" + " ".join(md[j].strip() for j in take) + "*", ""])
-        i = take[-1] + 1
-        while i < n and not md[i].strip():           # 흡수한 줄 뒤 빈 줄 정리
-            i += 1
-    return out
-
-
-PDF_READ_LIMIT_MB = 100      # 읽기 도구가 PDF 텍스트 추출을 거부하는 경계(실측)
-
-
-def ai_preamble(pdf_name: str, images_dir_name: str, pdf_bytes: int) -> str:
-    """이 문서를 읽는 AI를 위한 자기 기술 안내 한 줄(인용 블록).
-
-    폴백 1순위는 PNG다. 읽기 도구는 100MB를 넘는 PDF의 열람을 거부하는데
-    교재 스캔본은 대개 이를 초과한다(보유 5권 실측 88~748MB, 4권이 초과).
-    PDF를 1순위로 안내하면 AI가 열리지 않는 경로로 유도되므로 순서를 뒤집고,
-    이 책이 열리는 크기인지도 함께 알려 준다.
-    """
-    mb = pdf_bytes / 1048576
-    note = (f"원본 PDF(`{pdf_name}`, {mb:.0f}MB)도 같은 폴더에 있으나, 읽기 도구는 "
-            f"{PDF_READ_LIMIT_MB}MB를 넘는 PDF를 열지 못한다"
-            + ("—이 책이 그에 해당하므로 PNG가 유일한 폴백이다."
-               if mb > PDF_READ_LIMIT_MB else "(이 책은 그 아래라 열람 가능)."))
-    return (f"> **AI 안내**: 이 문서는 `{pdf_name}`의 OCR 변환본이다. "
-            "'## N페이지' 절은 원본 PDF의 N쪽과 1:1로 대응한다. 그림·표·수식을 "
-            f"정밀하게 확인해야 할 때는 '{images_dir_name}' 폴더의 PNG를 열람하라 "
-            "— 본문의 그림 링크가 그대로 파일 경로이며, 원본 화소가 보존되어 있어 "
-            "OCR이 표로 옮기지 못한 도표도 판독할 수 있다. 쪽 제목의 '(인쇄 N쪽)'은 "
-            "교재에 인쇄된 쪽번호다 — 학생이 '교재 274쪽'이라 하면 그 값으로 찾아라. "
-            "PDF 쪽과 인쇄 쪽의 차이는 일정하지 않아(같은 책 안에서도 변한다) "
-            f"산술로 환산하면 안 된다. {note}")
-
-
-_BODY_SKIP = ("!", "|", "#", ">", "$$", "*")
-
-
-def body_chars(md: list[str]) -> int:
-    """그림·표·헤딩·캡션을 뺀 순수 본문 글자 수 — 조용한 전멸 판정에 쓴다."""
-    n = 0
-    for line in md:
-        s = line.strip()
-        if not s or s.startswith(_BODY_SKIP):
-            continue
-        n += len(re.sub(r"\s", "", _MATH_SPAN.sub(" ", s)))
-    return n
-
-
-def has_ink(page_image, thresh: int = 250, min_ratio: float = 0.002) -> bool:
-    """쪽에 실제로 내용이 있는지 — 백지 쪽과 '내용이 있는데 다 놓친 쪽'을 가른다."""
-    small = page_image.convert("L").resize((160, 220))
-    dark = sum(1 for p in small.getdata() if p < thresh)
-    return dark / (160 * 220) > min_ratio
-
-
 _PREAMBLE_LINE = re.compile(r"(?m)^> \*\*AI 안내\*\*: .*$")
-_PAGE_HEAD_NO = re.compile(r"(?m)^## (\d+)페이지 \(인쇄 (\d+)쪽\)$")
-_PAGE_HEAD_ANY = re.compile(r"(?m)^## (\d+)페이지(?: \(인쇄 (\d+)쪽\))?$")
-PAGE_NO_WINDOW = 10      # 이웃 판정 창(앞뒤 쪽 수)
-PAGE_NO_MIN_VOTES = 3    # 창 안에 이만큼 있어야 판정한다
-PAGE_NO_TOL = 1          # 이웃 중앙값과 이만큼 넘게 어긋나면 오탐
-PAGE_NO_FILL_GAP = 20    # 오프셋이 같은 두 확정값 사이가 이 폭 이하면 메운다
-PAGE_NO_MAX_REPEAT = 3   # 같은 인쇄 번호가 이만큼의 쪽에 나오면 쪽번호가 아니다
-
-
-def split_repeated_page_numbers(pairs: list[tuple[int, int]]):
-    """(쪽마다 하나뿐인 값, 여러 쪽에 되풀이되는 값)으로 가른다.
-
-    장 번호를 쪽번호로 읽으면 그 장의 모든 쪽이 같은 값('1')을 받는다. 그러면
-    오프셋이 한 칸씩 늘어나는 그 값들이 서로의 이웃 검증을 통과시켜 준다 — 실측
-    Floyd(쪽번호가 인쇄되지 않은 판본)에서 1장 내내 '인쇄 1쪽'이 붙었고, 이웃
-    대조 뒤에도 틀린 값 4개가 남았다. 그래서 되풀이 값은 이웃 대조에서 빼 둔다.
-    """
-    from collections import Counter
-
-    seen = Counter(n for _p, n in pairs)
-    return ([(p, n) for p, n in pairs if seen[n] < PAGE_NO_MAX_REPEAT],
-            [(p, n) for p, n in pairs if seen[n] >= PAGE_NO_MAX_REPEAT])
-
-
-def agreeing_page_numbers(cands: list[tuple[int, int]],
-                          anchors: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """후보 중 그 자리의 확정된 이웃(anchors) 오프셋과 맞는 것만 돌려준다.
-
-    되풀이 값에도 진짜가 하나 섞여 있다 — 1장 첫 쪽의 '1'은 목차·장 표지에서도
-    '1'을 읽는 바람에 되풀이 값이 된다(실측 응용수학 PDF 16쪽 '1', 17쪽 '2').
-    확정된 이웃과 오프셋이 맞으면 되살린다. 이웃이 없으면(Floyd) 되살지 않는다.
-    """
-    offs = dict((p, p - n) for p, n in anchors)
-    out = []
-    for p, n in cands:
-        near = sorted(o for q, o in offs.items() if abs(q - p) <= PAGE_NO_WINDOW)
-        if (len(near) >= PAGE_NO_MIN_VOTES
-                and abs((p - n) - near[len(near) // 2]) <= PAGE_NO_TOL):
-            out.append((p, n))
-    return out
-
-
-def settle_pairs(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """(PDF쪽, 인쇄쪽) 후보를 확정한다 — settle_page_numbers의 순수한 몸통.
-
-    유일한 값끼리 이웃 대조 → 되풀이 값은 확정된 이웃과 맞을 때만 되살림 →
-    증가하는 최장 부분열 → 두 앵커가 증명하는 빈칸 채우기.
-    """
-    unique, repeated = split_repeated_page_numbers(pairs)
-    base = confirm_page_numbers(unique)
-    return fill_page_numbers(rising_page_numbers(
-        base + agreeing_page_numbers(repeated, base)))
-
-
-def confirm_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """이웃 오프셋 중앙값과 어긋나는 (PDF쪽, 인쇄쪽)을 버린다.
-
-    쪽마다 독립으로 읽으면 머리말의 다른 숫자(장 번호·연도·수식)가 쪽번호로
-    둔갑한다 — 실측: 전자기학은 머리말에 쪽번호가 아예 없는데 562쪽 중 13쪽에
-    엉뚱한 값이 붙었고(예: PDF 81쪽 → '인쇄 22쪽').
-
-    허용 오차 1: 예전 값 3은 실측에서 오탐을 그대로 통과시켰다 — 반도체 교재는
-    본문 오프셋이 25로 일정한데 오독이 22·27로 떨어져 ±3 문턱을 아슬아슬하게
-    넘겼고, PDF 200쪽이 실제 175쪽인데 '인쇄 178쪽'으로 새겨져 203쪽과 값이
-    겹쳤다. 1로 조여도 정상인 세 권은 한 개도 잃지 않는다(485→485, 921→921,
-    960→960 실측) — 진짜 드리프트는 창 중앙값도 함께 움직이기 때문이다.
-    """
-    offs = {pdf: pdf - pr for pdf, pr in pairs}
-    keep = []
-    for pdf, pr in pairs:
-        near = sorted(o for p, o in offs.items()
-                      if p != pdf and abs(p - pdf) <= PAGE_NO_WINDOW)
-        if len(near) < PAGE_NO_MIN_VOTES:
-            continue          # 고립된 값은 검증할 수 없다
-        if abs(offs[pdf] - near[len(near) // 2]) > PAGE_NO_TOL:
-            continue
-        keep.append((pdf, pr))
-    return keep
-
-
-def rising_page_numbers(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """인쇄 번호가 PDF 쪽 순서대로 증가하는 최장 부분열만 남긴다.
-
-    책의 인쇄 쪽번호는 뒤로 갈수록 반드시 커진다. 이웃 대조를 통과하고도
-    앞 값과 같거나 작은 값은(앞표지·화보의 아라비아 숫자 오독) 그 자체로
-    증거가 부정한다. 최장 증가 부분열을 남기면 역행이 0이 된다.
-    """
-    if not pairs:
-        return []
-    pairs = sorted(pairs)
-    tails: list[int] = []      # tails[i] = 길이 i+1 부분열의 최소 끝값
-    tail_at: list[int] = []    # 그 부분열의 마지막 원소 인덱스
-    prev: list[int | None] = [None] * len(pairs)
-    for i, (_pdf, pr) in enumerate(pairs):
-        j = bisect_left(tails, pr)
-        if j == len(tails):
-            tails.append(pr)
-            tail_at.append(i)
-        else:
-            tails[j] = pr
-            tail_at[j] = i
-        prev[i] = tail_at[j - 1] if j > 0 else None
-    out, cur = [], tail_at[len(tails) - 1]
-    while cur is not None:
-        out.append(pairs[cur])
-        cur = prev[cur]
-    return out[::-1]
-
-
-def fill_page_numbers(pairs: list[tuple[int, int]],
-                      gap: int = PAGE_NO_FILL_GAP) -> list[tuple[int, int]]:
-    """오프셋이 같은 두 확정값 사이의 빈 쪽을 메운다.
-
-    산술 환산이 아니다 — 앞뒤 두 앵커가 모두 검증됐고 그 사이에서 오프셋이
-    변하지 않았음을 두 값이 함께 증명할 때만 메운다(b-a == n_b-n_a). 인쇄
-    쪽번호는 번호가 찍히지 않은 쪽에도 매겨지므로, 구간 안의 모든 쪽은
-    앵커에서 한 칸씩 센 값이다. 오프셋이 다르면 구간 안에서 무언가 어긋난
-    것이므로 손대지 않는다. 폭을 20쪽으로 제한하는 것도 같은 이유다 —
-    구간이 길수록 상쇄되는 두 개의 스캔 사고가 숨을 여지가 커진다.
-
-    실측 회수율: 92.4%→95.6%, 94.1%→96.8%, 91.6%→97.2%, 21.9%→39.8%.
-    """
-    got = dict(pairs)
-    out = dict(pairs)
-    keys = sorted(got)
-    for a, b in zip(keys, keys[1:]):
-        if b - a < 2 or b - a > gap:
-            continue
-        if b - a != got[b] - got[a]:
-            continue
-        for p in range(a + 1, b):
-            out[p] = got[a] + (p - a)
-    return sorted(out.items())
-
-
-def settle_page_numbers(md_path: Path) -> tuple[int, int, int]:
-    """인쇄 쪽번호를 확정한다. 반환: (지운 수, 채운 수, 바로잡은 수).
-
-    오탐을 지우고, 확정값이 증명하는 빈칸을 메운다. 오탐이 지워진 자리에
-    앵커가 다른 값을 증명하면 그 자리는 '바로잡힌' 것이다(실측: 반도체
-    PDF 200쪽 '인쇄 178쪽' → 실제 머리말 175쪽).
-
-    확인 못 한 쪽번호는 없는 것보다 나쁘다 — AI가 그 값을 믿고 엉뚱한 쪽을
-    읽는다. 반대로 두 앵커가 증명하는 쪽번호를 비워 두는 것도 손해다.
-    """
-    text = md_path.read_text(encoding="utf-8")
-    hits = [(int(m.group(1)), int(m.group(2)) if m.group(2) else None, m.span())
-            for m in _PAGE_HEAD_ANY.finditer(text)]
-    if not hits:
-        return 0, 0, 0
-    have = [(p, n) for p, n, _s in hits if n is not None]
-    final = dict(settle_pairs(have))
-    dropped = added = fixed = 0
-    out, last = [], 0
-    for pdf, old, (s, e) in hits:
-        new = final.get(pdf)
-        if new == old:
-            continue
-        if new is None:
-            dropped += 1
-        elif old is None:
-            added += 1
-        else:
-            fixed += 1
-        head = f"## {pdf}페이지" + (f" (인쇄 {new}쪽)" if new is not None else "")
-        out.append(text[last:s])
-        out.append(head)
-        last = e
-    if not out:
-        return 0, 0, 0
-    out.append(text[last:])
-    md_path.write_text("".join(out), encoding="utf-8")
-    return dropped, added, fixed
 
 
 def settle_line_joins(md_path: Path) -> tuple[int, int]:
@@ -1503,11 +327,6 @@ def _discard_output(out_path: Path, images_dir: Path) -> None:
             images_dir.rmdir()
         except OSError:
             pass
-
-
-def _squash(text: str) -> str:
-    """공백과 줄바꿈 이음 표식을 모두 뺀다 — 같은 글인지 견줄 때 쓴다."""
-    return re.sub(rf"[\s{JOIN}]+", "", text)
 
 
 def upright_page(page_image, tmp_dir: Path, page_no: int):
@@ -1682,71 +501,6 @@ def looks_like_prose(text: str, strict: bool = False) -> bool:
     if len(_PROSE_HANGUL.findall(text)) >= TEXTBOX_MIN_HANGUL:
         return True
     return not strict and len(_PROSE_WORD.findall(text)) >= TEXTBOX_MIN_WORDS
-
-
-_PAGE_NO_TOKEN = re.compile(r"(?<![\d.])(\d{1,4})(?![\d.])")
-# 낱자로 흩어진 숫자 런만 붙인다('8 7 4' → '874'). 인접 숫자 사이 공백을
-# 무조건 지우면 '392 16장'이 '39216장'이 되어 쪽번호가 사라진다(실측).
-_SPACED_DIGITS = re.compile(r"(?<!\d)\d(?: \d)+(?!\d)")
-PAGE_NO_DRIFT = 60          # PDF 쪽과 이만큼 넘게 벌어지면 쪽번호가 아니다
-# 쪽번호를 찾을 상단 띠. 좁은 것을 먼저 보고, 못 찾을 때만 넓힌다 — 한 값으로는
-# 안 된다(실측 12쪽 표본): 7.2%는 응용수학을 12/12 맞히지만 전자기학은 1/12뿐이고,
-# 11%로 넓히면 전자기학이 11/12(오프셋 전부 일치)로 뛰는 대신 응용수학이 3/12로
-# 무너진다 — 넓은 띠가 본문 숫자를 함께 물어 오기 때문이다. 순차 폴백은 좁은 띠가
-# 이미 찾은 답을 절대 잃지 않고, 못 찾은 쪽에서만 넓은 띠를 시도한다.
-HEADER_PROBE_RATIOS = (0.072, 0.11)
-
-
-def printed_page_number(header_text: str, page_no: int) -> int | None:
-    """머리말 한 줄에서 인쇄 쪽번호를 읽어낸다(못 찾으면 None).
-
-    머리말은 '274  CHAPTER 7 일차 회로' 또는 '14.3 삼중적분  495'처럼 쪽번호가
-    양끝에 붙는다. 장 번호('CHAPTER 7')·절 번호('14.3')와 헷갈리지 않도록
-    소수점에 붙은 숫자를 빼고, PDF 쪽 번호와 상식적인 거리(±60) 안에 있는
-    후보만 받는다 — 오프셋은 책마다·구간마다 다르지만 그 정도로 벌어지지는
-    않는다(실측 최대 +26).
-
-    저품질 내장층은 숫자를 낱자로 띄워 새긴다('8 7 4') — 먼저 붙인다.
-    """
-    t = _SPACED_DIGITS.sub(lambda m: m.group(0).replace(" ", ""),
-                           " ".join((header_text or "").split()))
-    if not t:
-        return None
-    best = None
-    for m in _PAGE_NO_TOKEN.finditer(t):
-        v = int(m.group(1))
-        if v < 1 or abs(page_no - v) > PAGE_NO_DRIFT:
-            continue
-        # 양끝에 가까울수록 쪽번호답다(가운데 숫자는 본문·장 번호일 확률이 큼)
-        edge = min(m.start(), len(t) - m.end())
-        if best is None or edge < best[0]:
-            best = (edge, v)
-    return best[1] if best else None
-
-
-def read_printed_page(bands: list[str], page_image, tmp_dir: Path, page_no: int,
-                      early=None) -> int | None:
-    """상단 머리말 띠를 직접 읽어 인쇄 쪽번호를 회수한다.
-
-    파이프라인의 줄 목록에 기대지 않는다 — 책에 따라 머리말이 줄로 잡히지
-    않는다(실측: 응용수학·전기회로는 header_band 안에 줄이 0개였다).
-    띠마다 내장 텍스트층(bands)을 먼저 보고, 못 읽으면 띠만 한 줄 OCR한다.
-    early는 첫 띠의 OCR을 선행 스레드가 미리 띄워 둔 작업이다(precompute_page).
-    """
-    for i, ratio in enumerate(HEADER_PROBE_RATIOS):
-        n = printed_page_number(bands[i], page_no)
-        if n is None:
-            if i == 0 and early is not None:
-                try:
-                    txt = early.result()
-                except Exception:
-                    txt = ""
-            else:
-                txt = pdf_text.ocr_top_band(page_image, tmp_dir, f"{page_no}_{i}", ratio)
-            n = printed_page_number(txt, page_no)
-        if n is not None:
-            return n
-    return None
 
 
 def process_page(page, inp: dict, images_dir: Path, page_no: int,
