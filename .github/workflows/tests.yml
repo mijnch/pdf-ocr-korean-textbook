@@ -6,10 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read        # 저장소를 읽기만 한다 — GITHUB_TOKEN 을 쓰기 권한 없이 발급받는다
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}   # 같은 브랜치에 연달아 푸시하면 앞 실행을 취소한다
+  cancel-in-progress: true
+
 jobs:
   golden:
     # 이 도구는 Windows 전용(DirectML·Tesseract 경로)이므로 실제 대상 플랫폼·버전에서 검증한다.
     runs-on: windows-latest
+    timeout-minutes: 20   # 실제 실행은 1~2분. 러너가 멈춰도 기본값(6시간)까지 돌지 않게 한다
 
     # pwsh(PowerShell 7)는 스크립트를 UTF-8로 읽는다. Windows PowerShell 5.1이나
     # cmd 는 한글이 든 파일 이름을 깨뜨리므로 여기서는 쓰지 않는다.

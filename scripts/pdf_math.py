@@ -23,8 +23,8 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 # 생성이 O(n^2)였고, ONNX initializer를 PyTorch로 이식해 with-past로
 # 재수출+양자화한 것. 실측(공학수학1 5페이지 305수식 A/B): 인식 4.16배,
 # 정규화 일치 90.8% (차이는 \biggl<->\left 등 렌더 동등 변형).
-# 폴백 모델(fp32 원본·int8dec)은 컴팩트화로 삭제됨 — 폴더가 파손되면
-# 동봉된 mfr_transplant.py / mfr_export.py로 재제작하거나 재다운로드한다.
+# 폴백 모델(fp32 원본·int8dec)은 컴팩트화로 삭제됨 — 폴더가 파손되면 '환경 설치.bat' 으로
+# 릴리스에서 다시 받는다(원본에서 재제작은 scripts/mfr_rebuild/ 의 mfr_transplant.py·mfr_export.py).
 # ★ common 을 여기서 import 하는 이유: common 이 PIX2TEXT_HOME 을 설정하는데,
 # 그 값은 pix2text 가 import 되기 전에 정해져 있어야 한다(pix2text 는 import
 # 시점에 data_dir()을 굳힌다). pix2text import 는 load_models() 안에서 지연
@@ -150,8 +150,8 @@ def load_models():
         if not (MFR_KV_DIR / "decoder_with_past_model.onnx").exists():
             raise RuntimeError(
                 f"수식 인식 모델이 없습니다: {MFR_KV_DIR}\n"
-                "폴더 안의 mfr_transplant.py / mfr_export.py로 재제작하거나, "
-                "breezedeus/pix2text-mfr ONNX를 재다운로드해 재제작하세요."
+                "도구 폴더의 '환경 설치.bat'을 실행하면 릴리스에서 다시 받습니다.\n"
+                "(원본에서 다시 만들려면 scripts/mfr_rebuild/ 의 mfr_transplant.py — README 참고)"
             )
         # use_cache=True 필수 — pix2text 기본값(False)이면 KV캐시를 안 쓴다
         _mfr = LatexOCR(model_dir=MFR_KV_DIR,

@@ -1,0 +1,26 @@
+# GitHub 가 이 파일을 읽어 저장소 페이지에 "Cite this repository" 를 띄운다 (Citation File Format 1.2.0).
+cff-version: 1.2.0
+message: "이 저장소를 인용할 때는 아래 정보를 써 주세요. / If you use this software, please cite it as below."
+type: software
+title: "pdf-ocr-korean-textbook: 한국어 교재 PDF를 수식까지 살린 Markdown으로 바꾸는 오프라인 OCR 파이프라인"
+authors:
+  - family-names: Choi
+    given-names: Minjoon
+    email: mijnch@gmail.com
+repository-code: "https://github.com/mijnch/pdf-ocr-korean-textbook"
+url: "https://github.com/mijnch/pdf-ocr-korean-textbook"
+license: MIT
+keywords:
+  - ocr
+  - pdf
+  - markdown
+  - latex
+  - korean
+  - tesseract
+  - onnxruntime
+  - directml
+  - quantization
+  - document-ai
+  - offline
+  - on-device
+abstract: "한국어 대학 교재 PDF(스캔본·내장 텍스트층)를 완전 오프라인으로 쪽별 Markdown + PNG로 바꾼다. 수식은 LaTeX로 인식하고(KV캐시 + int8로 재제작한 ONNX 디코더), 인코더는 내장 GPU(DirectML)로 돌린다."

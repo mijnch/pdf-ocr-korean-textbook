@@ -24,7 +24,14 @@ def _parse_profiles(data: dict) -> tuple[dict[str, dict[int, str]], set[str]]:
     """
     out: dict[str, dict[int, str]] = {}
     force_scan: set[str] = set()
-    for book in data.get("book", []):
+    books = data.get("book", [])
+    if not isinstance(books, list):     # [[book]] 이 아니라 book = "..." 처럼 적은 경우
+        print("[장구분] book 항목이 [[book]] 목록이 아니어서 장 헤딩 없이 진행합니다", file=sys.stderr)
+        books = []
+    for book in books:
+        if not isinstance(book, dict):
+            print(f"[장구분] 잘못된 책 항목을 건너뜁니다: {book!r}", file=sys.stderr)
+            continue
         name = book.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
@@ -34,8 +41,13 @@ def _parse_profiles(data: dict) -> tuple[dict[str, dict[int, str]], set[str]]:
         if book.get("force_scan") is True:
             force_scan.add(name.strip())
         pages: dict[int, str] = {}
-        for ch in book.get("chapters", []):
-            page, title = ch.get("page"), ch.get("title")
+        chapters = book.get("chapters", [])
+        if not isinstance(chapters, list):
+            print(f"[장구분] '{name}'의 chapters 가 목록이 아니어서 건너뜁니다: {chapters!r}",
+                  file=sys.stderr)
+            chapters = []
+        for ch in chapters:
+            page, title = (ch.get("page"), ch.get("title")) if isinstance(ch, dict) else (None, None)
             if isinstance(page, int) and page >= 1 and isinstance(title, str) and title.strip():
                 pages[page] = title.strip()
             else:
