@@ -155,7 +155,7 @@ def recount_marker(md_text: str) -> str:
 
 
 _SKIP_LINE = ("!", "|", "#", ">", "$$", "*")
-_MATH = re.compile(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)", re.S)
+_MATH = re.compile(r"(?<!\\)\$\$.+?(?<!\\)\$\$|(?<![$\\])\$[^$\n]+?(?<!\\)\$(?!\$)", re.S)
 _HANGUL_ONLY = re.compile(r"[가-힣]")   # 공백을 넣으면 공백 창이 반복으로 잡힌다
 _SUP_OK = re.compile(r"10\^\{")
 _SUP_FLAT = re.compile(r"[Xx×]\s*10[-−]?\d")

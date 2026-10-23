@@ -261,11 +261,18 @@ check("sem flow no false heading",
           1000) if l.startswith("###")])
 
 # ─── settle_page_numbers: 이웃 대조·증가열·앵커 보충으로 인쇄 쪽번호 확정 ───
+# 한 임시 폴더를 함께 쓰고 실행이 끝나면 지운다(TemporaryDirectory 는 종료 때 스스로 치운다) —
+# 예전에는 mkdtemp 로 실행마다 폴더 6개를 시스템 TEMP 에 남겼다.
+_SETTLE_TMP = tempfile.TemporaryDirectory(prefix="pdfocr_settle_")
+_mk_n = [0]
+
+
 def _mk(pairs):
     """(pdf쪽, 인쇄쪽 또는 None) 목록 → 임시 MD 파일."""
     body = "\n\n".join(f"## {p}페이지" + (f" (인쇄 {q}쪽)" if q else "") + "\n\n본문"
                        for p, q in pairs)
-    f = Path(tempfile.mkdtemp()) / "t.md"
+    _mk_n[0] += 1
+    f = Path(_SETTLE_TMP.name) / f"t{_mk_n[0]}.md"
     f.write_text(body + "\n", encoding="utf-8")
     return f
 
@@ -649,6 +656,16 @@ check("parse book chapters", _prof["책A"] == {5: "제1장 가", 2: "제2장 나
 check("parse force_scan", _fscan == {"책B"} and _prof["책B"] == {1: "장"})
 check("parse skip bad entries", "책C" not in _prof)   # 유효 항목이 하나도 없음
 check("parse skip noname", all(n for n in _prof))
+_bad_shapes = []
+for _fx_bad in ({"book": "책"}, {"book": [{"name": "x", "chapters": ["제1장"]}]},
+                {"book": [{"name": "x", "chapters": 5}]}, {"book": ["책", {"name": "y", "chapters": [
+                    {"page": 3, "title": "제1장"}]}]}):
+    try:
+        _bad_shapes.append(pdf_chapters._parse_profiles(_fx_bad))
+    except Exception as _e:
+        _bad_shapes.append(_e)
+check("parse wrong shapes (valid TOML) skipped, not fatal",
+      _bad_shapes[:3] == [({}, set())] * 3 and _bad_shapes[3] == ({"y": {3: "제1장"}}, set()))
 # 실데이터는 구조만 확인 — 개수는 사용자가 편집해도 되도록 못 박지 않는다.
 # 장구분.toml 은 개인 프로파일이라 저장소에 없다(장구분.example.toml 만 배포).
 # 그러니 새로 설치한 PC에서는 이 두 건을 건너뛴다 — 없다고 실패로 세면
@@ -858,6 +875,25 @@ try:
         check("tesseract not found", common.find_tesseract() is None)
 finally:
     common.TESSERACT_DIR, common.shutil.which = _saved_dir, _saved_which
+
+# 본문의 \$ 는 수식 구분자가 아니다 — 뒤따르는 진짜 수식과 짝지어 사이 본문을 수식으로 보던 것
+_esc = r"가격 \$3 이고 | 잡음 ~ $x$ 이다"
+check("escaped dollar is not a math delimiter",
+      [m.group() for m in pdf_text._MATH_SPAN.finditer(_esc)] == ["$x$"]
+      and [m.group() for m in pdf_audit._MATH.finditer(_esc)] == ["$x$"])
+check("escaped dollars keep the page's body (no false empty page)",
+      pdf_audit.empty_pages("## 1페이지\n\n가격 \\$3 이고 원가는 \\$5 이다\n\n"
+                            "## 2페이지\n\n본문 내용이 충분히 있는 쪽입니다\n") == [])
+
+# 스캔 표 셀의 '|' 는 pdf_table.extract 가 한 번만 이스케이프한다(두 번이면 표 줄이 깨진다)
+_real_cell = pdf_text._ocr_cell_scaled
+pdf_text._ocr_cell_scaled = lambda *_a, **_k: ("a|b", 99.0)
+try:
+    _cell_fn, _cell_bad = pdf_text.make_scan_cell_fn(None, Path("."), "t")
+    _cell = _cell_fn((0, 0, 10, 10))
+finally:
+    pdf_text._ocr_cell_scaled = _real_cell
+check("scan cell pipe left for pdf_table to escape once", _cell == "a|b" and _cell_bad[0] == 0)
 
 # 병렬로 띄운 Tesseract끼리 OpenMP 스레드를 다투지 않게 한다(Linux 실측: 쪽마다 시간 초과)
 check("tesseract OpenMP limited", pdf_text._tess_env().get("OMP_THREAD_LIMIT") == "1")

@@ -39,7 +39,7 @@ def _strip_noise(sec: str) -> str:
     용어에 '대학수학_OCR_images/p'가 올라왔다).
     """
     sec = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", sec)
-    sec = re.sub(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)", " ", sec, flags=re.S)
+    sec = re.sub(r"(?<!\\)\$\$.+?(?<!\\)\$\$|(?<![$\\])\$[^$\n]+?(?<!\\)\$(?!\$)", " ", sec, flags=re.S)
     return re.sub(r"(?m)^[#>|*].*$", " ", sec)
 
 

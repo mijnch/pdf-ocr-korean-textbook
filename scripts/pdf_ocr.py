@@ -58,18 +58,8 @@ from pdf_latex import (  # noqa: F401
 import pdf_text  # noqa: F401
 from pdf_text import (  # noqa: F401
     HIRES_MAX_DPI,
-    JOIN,
-    MASK_MARGIN,
-    _MATH_SPAN,
-    MIN_LINE_CONF,
     OCR_MIN_DPI,
-    PSM_CANDIDATES,
     RENDER_DPI,
-    RESCUE_MIN_CONF,
-    RESCUE_MIN_WORDISH,
-    SCAN_CELL_MIN_CONF,
-    SCAN_CELL_SCALES,
-    TESS_LANG,
     _WATERMARK_RE,
     _WORDISH,
     clean_text,
@@ -84,7 +74,6 @@ from pdf_text import (  # noqa: F401
     ocr_region_text,
     resolve_joins,
     _squash,
-    start_tesseract,
     tesseract_lines,
     vote_lines,
 )
@@ -1068,9 +1057,13 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                         if angle:
                             print(f"    {page_no}페이지: 눕힌 쪽으로 판단해"
                                   f" {angle}도 세워 다시 인식합니다")
+                            retry_inp = {**inp, "image": fixed, "hires": None, "ocr": None}
+                            # 다음 쪽 선계산이 아직 돌고 있을 수 있다 — 같은 모델 싱글턴을 두 스레드가
+                            # 동시에 돌리지 않게 같은 1인 풀에 줄 세워, 그것이 끝난 뒤 계산한다.
+                            pre2 = _PREFETCH_POOL.submit(
+                                precompute_page, retry_inp, tmp_dir, page_no).result()
                             page_md, n_formulas, source, printed = process_page(
-                                page, {**inp, "image": fixed, "hires": None, "ocr": None},
-                                images_dir, page_no, tmp_dir)
+                                page, retry_inp, images_dir, page_no, tmp_dir, pre=pre2)
                         if not body_chars(page_md):
                             blank_pages.append(page_no)
                 except Exception as e:  # 페이지 하나의 실패가 책 전체를 날리지 않도록
@@ -1092,9 +1085,10 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 )
             # 완료 표식 — 이 줄이 없으면 중단으로 잘린 파일이다(재실행 판단 근거).
             # 수식 수는 아래 확정 단계에서 파일 실측값으로 바뀐다(recount_marker).
+            # 본문을 못 건진 쪽은 표식에 적지 않는다 — recount_marker 가 늘 지웠다. 그 쪽들은
+            # 아래 경고 줄과 자가 감사(_감사.txt 의 '본문이 비어 있는 쪽')에 쪽 번호로 남는다.
             out.write(f"\n> [변환 완료] {num_pages}페이지, 검출 수식 {total_formulas}개"
                       + (f", 실패 {failed_pages}페이지" if failed_pages else "")
-                      + (f", 본문 못 건진 쪽 {len(blank_pages)}개" if blank_pages else "")
                       + "\n")
     except BaseException:
         # 중단돼도 이음 표식만은 확정해 둔다 — 남으면 그 낱말을 grep이 못 찾는다

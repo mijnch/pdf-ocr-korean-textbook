@@ -45,7 +45,10 @@ _WORDISH = re.compile(r"[가-힣A-Za-z]")
 # 인라인/블록 수식 스팬($...$, $$...$$). 이 안은 MFR이 권위 있게 만든 LaTeX이므로
 # 본문용 노이즈 정리를 적용하면 안 된다 — |(절댓값·조건부확률·브라켓), \(간격·명령)이
 # 본문 잔재로 오인돼 파괴된다(검토단 B2 실측: 'P(A | B)' → 'P(A B)').
-_MATH_SPAN = re.compile(r"\$\$.+?\$\$|(?<!\$)\$[^$\n]+?\$(?!\$)")
+# 본문의 \$(이스케이프한 달러)는 구분자가 아니다 — 앞의 \$ 가 뒤따르는 진짜 수식과 짝을 지어
+# 사이 본문을 수식으로 보호하고(잡음 정리 생략), 감사가 그 쪽을 '본문 없음' 으로 오판했다.
+# 같은 패턴이 pdf_audit._MATH·pdf_glossary 에도 있다 — 함께 고친다.
+_MATH_SPAN = re.compile(r"(?<!\\)\$\$.+?(?<!\\)\$\$|(?<![$\\])\$[^$\n]+?(?<!\\)\$(?!\$)")
 # 단어 사이에 낀 외톨이 세로줄/역슬래시 노이즈("abc | def" → "abc def"). 수식 밖에서만.
 _BAR_NOISE = re.compile(r"\s+[|\\]\s+")
 _EDGE_BAR = re.compile(r"^(?:[|\\]\s+)+|(?:\s+[|\\])+$")
@@ -693,7 +696,7 @@ def make_scan_cell_fn(crop, tmp_dir: Path, name: str, boxes=(), pool=None):
         if not t1 and not t2:
             return ""                       # 양쪽 다 빈 셀 — 진짜 빈칸(불안정 아님)
         if t1 == t2 and min(c1, c2) >= SCAN_CELL_MIN_CONF:
-            return t1.replace("|", r"\|").replace("$", r"\$")
+            return t1.replace("$", r"\$")    # '|' 는 pdf_table.extract 가 한 번만 이스케이프한다
         counter[0] += 1                     # 불일치/저신뢰 → 표 폐기 신호
         return ""
 
