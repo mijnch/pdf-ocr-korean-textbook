@@ -28,7 +28,8 @@
   - 모델(레이아웃/수식)은 전체 실행에서 1회만 로드해 재사용한다.
   - 쪽들은 겹쳐 흐른다: 메인 스레드가 다음 쪽을 렌더링하고(pdfium 제약,
     prepare_page), 선행 스레드가 그 쪽의 레이아웃·수식 검출을 한 뒤 Tesseract를
-    띄운다(precompute_page) — 이번 쪽의 수식 인식(MFR)과 동시에 돈다. 페이지 최대
+    띄운다(precompute_page) — 이번 쪽의 수식 인식(MFR)과 동시에 돈다. 몇 쪽을 앞서
+    띄울지와 Tesseract 동시 작업 수는 설정이다(PAGES_AHEAD·TESS_WORKERS). 페이지 최대
     병목은 책 종류에 따라 다르다(실측): 내장 텍스트본은 MFR, 스캔본은 Tesseract.
   - 스캔 원본이 기준 해상도(200dpi)보다 높은 페이지는 원본 해상도로 한 번 더
     렌더링해 OCR 입력·수식 크롭·그림 저장에 쓴다(좌표 공간은 200dpi로 통일).
@@ -37,12 +38,17 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 import os
+import queue
 import re
 import sys
 import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 
 import pdf_audit
@@ -155,15 +161,92 @@ HEADER_BAND_RATIO = tuning.get("layout", "header_band_ratio")      # 머리말 �
 HEADER_MAX_CHARS = 60
 HEADER_EXT_RATIO = tuning.get("layout", "header_ext_ratio")        # 확장 띠(내용 병행)
 FOOT_BAND_RATIO = tuning.get("layout", "foot_band_ratio")          # 내장책 쪽번호 띠
+
+
+class PagePool:
+    """쪽 번호가 작은 작업부터 꺼내는 스레드 풀.
+
+    뒤쪽을 여럿 앞서 띄우면(PAGES_AHEAD) 대기열에 뒤쪽 작업이 쌓인다. 들어온 순서대로
+    꺼내는 풀(ThreadPoolExecutor)에서는 지금 마무리 중인 쪽이 새로 맡긴 작업(스캔 표
+    셀·선계산 재시도)이 그 뒤에 줄을 서고, 그동안 메인 스레드가 논다. 여기서는 쪽
+    번호가 작은 것부터, 같은 쪽 안에서는 들어온 순서대로 꺼낸다. 쪽 번호 없이 맡긴
+    작업(submit)은 누군가 지금 기다리는 것이므로 맨 앞(0쪽)에 선다.
+    스레드는 첫 작업 때 띄우는 데몬이다 — 중단(Ctrl+C)은 main()이 os._exit로 끝내고,
+    정상 종료 때는 맡긴 작업을 모두 거둔 뒤라 기다릴 것이 없다.
+    """
+
+    def __init__(self, workers: int):
+        self._workers = workers
+        self._queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._order = itertools.count()     # 같은 쪽 안의 도착 순서(비교가 Future까지 안 가게)
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        return self.submit_for(0, fn, *args, **kwargs)
+
+    def submit_for(self, page_no: int, fn, /, *args, **kwargs) -> Future:
+        fut: Future = Future()
+        with self._lock:
+            self._queue.put((page_no, next(self._order), fut, fn, args, kwargs))
+            if not self._threads:
+                self._threads = [threading.Thread(target=self._work, daemon=True)
+                                 for _ in range(self._workers)]
+                for t in self._threads:
+                    t.start()
+        return fut
+
+    def _work(self) -> None:
+        while True:
+            _page, _n, fut, fn, args, kwargs = self._queue.get()
+            if fn is None:                  # shutdown의 종료 신호
+                return
+            if not fut.set_running_or_notify_cancel():
+                continue                    # 취소된 작업
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as e:      # ThreadPoolExecutor와 같이 작업 결과로 넘긴다
+                fut.set_exception(e)
+            else:
+                fut.set_result(result)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        """대기 중인 작업을 (cancel_futures면 취소하고) 마친 뒤 스레드를 끝낸다."""
+        with self._lock:
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item[2] is not None:
+                        item[2].cancel()
+            threads, self._threads = self._threads, []
+            for _ in threads:               # 종료 신호는 어떤 작업보다도 뒤에 선다
+                self._queue.put((math.inf, next(self._order), None, None, (), {}))
+        if wait:
+            for t in threads:
+                t.join()
+
+
+# 뒤쪽을 몇 개까지 앞서 띄울지 — 그 쪽들의 렌더링·레이아웃·수식 검출·Tesseract가 이번
+# 쪽의 수식 인식·마무리와 겹쳐 돈다. 1이 예전(바로 다음 쪽만) 동작이다. 출력은 같고
+# 시간과 메모리만 달라진다(설정.toml [speed] — 산출물을 바이트 단위로 대조했다). 6코어
+# 실측(스캔본 16쪽)에서 2·3쪽은 ±8% 안이라 기본은 1이다 — 코어가 많은 PC에서 늘려 볼 값.
+PAGES_AHEAD = tuning.get("speed", "pages_ahead")
 # Tesseract를 MFR과 겹쳐 돌리는 전용 스레드 풀. 고해상 페이지의 두 Tesseract
 # 패스(400dpi 주 + 200dpi 보충)는 서로 의존이 없어 함께 돈다 — 실측 A/B(공학수학1
 # 5쪽): 워커 1→2에서 10.66→8.95초/쪽, 정확도 손실 0. 여기에 다음 쪽의 두 패스가
 # 선행 스레드에서 미리 올라오므로(precompute_page) 두 쪽 몫인 4를 둔다.
+# 앞서 띄우는 쪽을 늘려도 워커는 따라 늘리지 않는다 — 작업 하나가 프로세스 둘(두 분할
+# 모드)을 띄워, 6·8로 늘리면 같은 CPU를 쓰는 레이아웃이 2배 넘게(29→65·78초), 수식
+# 인식이 1.4배 느려져 전체가 오히려 느렸다(Neaman 16쪽 110→137·119초, 6코어 실측).
 # 외부 프로세스라 GIL 무관, 작업마다 temp 파일명(p{쪽}/p{쪽}r)이 달라 충돌하지 않는다.
-TESS_WORKERS = 4
-_TESS_POOL = ThreadPoolExecutor(max_workers=TESS_WORKERS)
-# 다음 페이지의 레이아웃+수식검출을 현재 페이지 MFR과 겹치는 선행 스레드
-_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1)
+TESS_WORKERS = tuning.get("speed", "tess_workers")
+_TESS_POOL = PagePool(TESS_WORKERS)
+# 앞선 쪽들의 레이아웃+수식검출을 이번 쪽 MFR과 겹치는 선행 스레드. 이 두 모델은
+# 이 스레드 하나만 돌린다 — 같은 모델 싱글턴을 두 스레드가 동시에 돌리지 않는다.
+_PREFETCH_POOL = PagePool(1)
 
 
 # ─────────────────────────── 본문 안전 정제 ───────────────────────────
@@ -423,19 +506,20 @@ def start_text_ocr(page_image, regions: list[dict], detections, ocr_hi,
     st = {"k": k, "dpi": dpi, "bands": bands, "foot": foot,
           "alt_main": [], "alt_resc": [], "rescue": None}
     if ocr_hi is None:
-        st["main"] = _TESS_POOL.submit(tesseract_lines, page_image, mask, tmp_dir,
-                                       bands, tag=f"p{page_no}")
+        st["main"] = _TESS_POOL.submit_for(page_no, tesseract_lines, page_image, mask,
+                                           tmp_dir, bands, tag=f"p{page_no}")
         return st
     # 고해상 입력으로 인식(좌표는 결과 수신 후 환산)
     mask_hi = [tuple(v * k for v in b) for b in mask]
     bands_hi = [(x0 * k, x1 * k) for x0, x1 in bands] if bands else None
-    st["main"] = _TESS_POOL.submit(tesseract_lines, ocr_hi, mask_hi, tmp_dir, bands_hi,
-                                   dpi, tag=f"p{page_no}", alternates=st["alt_main"])
+    st["main"] = _TESS_POOL.submit_for(page_no, tesseract_lines, ocr_hi, mask_hi, tmp_dir,
+                                       bands_hi, dpi, tag=f"p{page_no}",
+                                       alternates=st["alt_main"])
     # 고해상 사각지대 구조: 400dpi에서 Tesseract가 짧은 들여쓰기 줄을 PSM 불문
     # 놓치는 사례 실측(p567) — 기준 해상도로 한 번 더 읽어 주 결과에 없는 줄만
     # 보충한다. 이 판독은 줄 투표의 표로도 쓴다(vote_lines).
-    st["rescue"] = _TESS_POOL.submit(tesseract_lines, page_image, mask, tmp_dir, bands,
-                                     tag=f"p{page_no}r", alternates=st["alt_resc"])
+    st["rescue"] = _TESS_POOL.submit_for(page_no, tesseract_lines, page_image, mask, tmp_dir,
+                                         bands, tag=f"p{page_no}r", alternates=st["alt_resc"])
     return st
 
 
@@ -459,8 +543,8 @@ def precompute_page(inp: dict, tmp_dir: Path, page_no: int):
         started = start_text_ocr(image, regions, detections, ocr_hi, tmp_dir, page_no)
     header = None
     if printed_page_number(inp["bands"][0], page_no) is None:
-        header = _TESS_POOL.submit(pdf_text.ocr_top_band, image, tmp_dir,
-                                   f"{page_no}_0", HEADER_PROBE_RATIOS[0])
+        header = _TESS_POOL.submit_for(page_no, pdf_text.ocr_top_band, image, tmp_dir,
+                                       f"{page_no}_0", HEADER_PROBE_RATIOS[0])
     return regions, detections, started, header
 
 
@@ -942,6 +1026,7 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
     # 이름을 '(1)'로 밀어내 진짜 산출물을 밀쳐내던 문제). 파일 핸들 누수도 없다.
     pdf = pdfium.PdfDocument(str(pdf_path))
     out_path = None
+    ahead: deque = deque()   # 미리 띄운 쪽들: (쪽 번호, 입력, 선계산 작업) — 쪽 순서
     try:
         num_pages = len(pdf)
         # MD와 그림 폴더 둘 다 비어 있는 이름을 고른다 — MD만 지워진 잔존 폴더에
@@ -1014,11 +1099,27 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                         force_scan = True
                         print("         낮아서 스캔 경로로 전환합니다"
                               " — 출판사 선행 OCR이 망가진 책입니다.")
-            # 선행 파이프라인: 다음 쪽의 입력은 메인 스레드가 미리 마련하고
-            # (pdfium 제약), 선행 스레드가 그 쪽의 레이아웃·수식 검출을 한 뒤
-            # Tesseract까지 띄운다 — 스캔본은 다음 쪽의 인식이 이번 쪽의 수식
-            # 인식·마무리와 겹쳐 돈다.
-            nxt = nxt_future = None
+            # 선행 파이프라인: 뒤쪽 PAGES_AHEAD개의 입력은 메인 스레드가 미리
+            # 마련하고(pdfium 제약), 선행 스레드가 그 쪽들의 레이아웃·수식 검출을
+            # 차례로 한 뒤 Tesseract까지 띄운다 — 스캔본은 뒤쪽들의 인식이 이번
+            # 쪽의 수식 인식·마무리와 겹쳐 돈다. 첫 쪽·선계산이 실패한 쪽의 계산도
+            # 같은 선행 스레드에 맡긴다 — 같은 모델 싱글턴을 두 스레드가 동시에
+            # 돌리는 경합을 막는다(검토단 지적). 쪽 번호 순으로 꺼내므로 이번 쪽의
+            # 재계산이 미리 맡긴 뒤쪽들보다 먼저 돈다.
+            next_ahead = start_page             # 아직 미리 띄우지 않은 첫 쪽
+
+            def fill_ahead(last: int) -> None:
+                nonlocal next_ahead
+                while next_ahead <= min(last, num_pages):
+                    p = next_ahead
+                    next_ahead += 1
+                    try:
+                        inp_p = prepare_page(pdf[p - 1], force_scan)
+                    except Exception:
+                        continue  # 그 쪽 차례에 다시 마련해 보고, 안 되면 실패로 적는다
+                    ahead.append((p, inp_p, _PREFETCH_POOL.submit_for(
+                        p, precompute_page, inp_p, tmp_dir, p)))
+
             for page_no in range(start_page, num_pages + 1):
                 if page_no in chapters:
                     out.write(f"# {chapters[page_no]}\n\n")
@@ -1026,27 +1127,21 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 # 쪽번호를 함께 넣기 위해서다.
                 printed = None
                 try:
+                    while ahead and ahead[0][0] < page_no:  # 앞 쪽이 도중에 실패한 잔여분
+                        ahead.popleft()[2].cancel()
+                    fill_ahead(page_no + PAGES_AHEAD)
+                    mine = ahead.popleft() if ahead and ahead[0][0] == page_no else None
                     page = pdf[page_no - 1]
-                    inp = nxt if nxt is not None else prepare_page(page, force_scan)
+                    inp = mine[1] if mine else prepare_page(page, force_scan)
                     pre = None
-                    if nxt_future is not None:
+                    if mine:
                         try:
-                            pre = nxt_future.result()
+                            pre = mine[2].result()
                         except Exception:
-                            pre = None  # 선계산 실패 → 아래에서 동기 재계산
-                    nxt = nxt_future = None
+                            pre = None  # 선계산 실패 → 아래에서 한 번 더
                     if pre is None:
-                        # 프리페치를 던지기 전에 메인에서 동기 계산한다 — 같은 모델
-                        # 싱글턴을 두 스레드가 동시에 돌리는 경합(첫 페이지·선계산
-                        # 실패 페이지에서 발생)을 차단한다(검토단 지적).
-                        pre = precompute_page(inp, tmp_dir, page_no)
-                    if page_no < num_pages:  # 다음 페이지 몫을 미리 던져 둔다
-                        try:
-                            nxt = prepare_page(pdf[page_no], force_scan)
-                            nxt_future = _PREFETCH_POOL.submit(
-                                precompute_page, nxt, tmp_dir, page_no + 1)
-                        except Exception:
-                            nxt = nxt_future = None
+                        pre = _PREFETCH_POOL.submit_for(
+                            page_no, precompute_page, inp, tmp_dir, page_no).result()
                     page_md, n_formulas, source, printed = process_page(
                         page, inp, images_dir, page_no, tmp_dir, pre=pre)
                     # 조용한 전멸 방어: 잉크는 있는데 본문이 한 글자도 안 나온
@@ -1058,10 +1153,11 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                             print(f"    {page_no}페이지: 눕힌 쪽으로 판단해"
                                   f" {angle}도 세워 다시 인식합니다")
                             retry_inp = {**inp, "image": fixed, "hires": None, "ocr": None}
-                            # 다음 쪽 선계산이 아직 돌고 있을 수 있다 — 같은 모델 싱글턴을 두 스레드가
-                            # 동시에 돌리지 않게 같은 1인 풀에 줄 세워, 그것이 끝난 뒤 계산한다.
-                            pre2 = _PREFETCH_POOL.submit(
-                                precompute_page, retry_inp, tmp_dir, page_no).result()
+                            # 뒤쪽 선계산이 아직 돌고 있을 수 있다 — 같은 모델 싱글턴을 두 스레드가
+                            # 동시에 돌리지 않게 같은 1인 풀에 맡긴다(쪽 번호 순이라 미리 맡긴
+                            # 뒤쪽들보다 먼저, 지금 도는 것이 끝나면 바로 계산한다).
+                            pre2 = _PREFETCH_POOL.submit_for(
+                                page_no, precompute_page, retry_inp, tmp_dir, page_no).result()
                             page_md, n_formulas, source, printed = process_page(
                                 page, retry_inp, images_dir, page_no, tmp_dir, pre=pre2)
                         if not body_chars(page_md):
@@ -1091,6 +1187,9 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                       + (f", 실패 {failed_pages}페이지" if failed_pages else "")
                       + "\n")
     except BaseException:
+        # 미리 맡겨 두고 아직 돌지 않은 뒤쪽 선계산은 거둔다 — 다음 책의 작업과 CPU를 다투지 않게
+        for _p, _inp, fut in ahead:
+            fut.cancel()
         # 중단돼도 이음 표식만은 확정해 둔다 — 남으면 그 낱말을 grep이 못 찾는다
         if out_path is not None and out_path.is_file():
             try:

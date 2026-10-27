@@ -716,10 +716,11 @@ def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
     alternates에 목록을 주면 채택되지 않은 판독들을 거기 덧붙인다(줄 투표용).
 
     ★ tag는 호출자마다 반드시 달라야 한다 — tmp_dir는 책 한 권 전체가 공유하므로,
-    tag가 겹치면 서로 다른 쪽이 같은 임시 PNG(`band{tag}{i}.png`)에 겹쳐 쓴다.
+    tag가 겹치면 서로 다른 쪽이 같은 임시 PNG(`band{tag}_{i}.png`)에 겹쳐 쓴다.
     그러면 A쪽 OCR이 B쪽 이미지를 읽어 **조용히 틀린 본문**이 나온다(예외도 안 난다).
-    현재 호출부는 `p{page_no}` / `p{page_no}r`을 넘긴다. 쪽 간 파이프라이닝을
-    도입하더라도 이 규칙만 지키면 임시 파일 충돌은 발생하지 않는다.
+    현재 호출부는 `p{page_no}` / `p{page_no}r`을 넘긴다 — 여러 쪽을 앞서 띄워도
+    (pdf_ocr.PAGES_AHEAD) 쪽 번호가 들어 있어 겹치지 않는다. 칼럼 번호 앞의 '_'는
+    `p1`+`10`단과 `p11`+`0`단이 같은 이름이 되지 않게 한다.
     """
     from PIL import ImageDraw
 
@@ -739,11 +740,11 @@ def tesseract_lines(page_image, mask_boxes, tmp_dir: Path,
                 cx0 = max(0, int(bx0) - margin)
                 cx1 = min(masked.width, int(bx1) + margin)
                 crop = masked.crop((cx0, 0, cx1, masked.height))
-                started.append((cx0, _start_ocr(crop, tmp_dir, f"band{tag}{i}", dpi)))
+                started.append((cx0, _start_ocr(crop, tmp_dir, f"band{tag}_{i}", dpi)))
             all_lines: list[dict] = []
             failed: list[str] = []
             for i, (cx0, st) in enumerate(started):
-                lines, ok, err = _ocr_image(None, tmp_dir, f"band{tag}{i}", x_off=cx0,
+                lines, ok, err = _ocr_image(None, tmp_dir, f"band{tag}_{i}", x_off=cx0,
                                             dpi=dpi, alternates=alternates, started=st)
                 all_lines += lines
                 if not ok:

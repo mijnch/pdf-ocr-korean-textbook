@@ -898,6 +898,70 @@ check("scan cell pipe left for pdf_table to escape once", _cell == "a|b" and _ce
 # 병렬로 띄운 Tesseract끼리 OpenMP 스레드를 다투지 않게 한다(Linux 실측: 쪽마다 시간 초과)
 check("tesseract OpenMP limited", pdf_text._tess_env().get("OMP_THREAD_LIMIT") == "1")
 
+# ─── 쪽 간 선행: 앞 쪽 작업부터 꺼내고, 쪽마다 임시 파일 이름이 다르다 ───
+import threading  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+_pool = pdf_ocr.PagePool(1)
+_gate = threading.Event()
+_ran = []
+_pool.submit_for(0, _gate.wait)          # 일꾼 하나를 붙잡아 두고 뒤에 줄을 세운다
+_futs = [_pool.submit_for(p, _ran.append, name)
+         for p, name in ((3, "p3"), (1, "p1-a"), (2, "p2"), (1, "p1-b"))]
+_futs.append(_pool.submit(_ran.append, "now"))   # 쪽 번호 없음 = 지금 기다리는 작업
+_gate.set()
+for _f in _futs:
+    _f.result(timeout=10)
+check("page pool runs earlier pages first, FIFO within a page",
+      _ran == ["now", "p1-a", "p1-b", "p2", "p3"])
+
+
+def _boom():
+    raise ValueError("boom")
+
+
+_fe = _pool.submit_for(1, _boom)
+try:
+    _fe.result(timeout=10)
+    _raised = False
+except ValueError:
+    _raised = True
+check("page pool hands a job's exception to its future and keeps working",
+      _raised and _pool.submit(lambda: 42).result(timeout=10) == 42)
+
+_gate2 = threading.Event()
+_pool.submit(_gate2.wait)
+_fc = _pool.submit_for(5, _ran.append, "cancelled")
+check("page pool cancels a queued job", _fc.cancel())
+_gate2.set()
+_pool.shutdown(wait=True)
+check("page pool shutdown drains and stops", "cancelled" not in _ran and _pool._threads == [])
+
+_pool = pdf_ocr.PagePool(1)
+_gate3 = threading.Event()
+_pool.submit(_gate3.wait)
+_queued = [_pool.submit_for(p, _ran.append, f"q{p}") for p in (1, 2)]
+_pool.shutdown(wait=False, cancel_futures=True)   # Ctrl+C 경로
+_gate3.set()
+check("page pool shutdown cancels queued jobs", all(f.cancelled() for f in _queued))
+
+# 여러 쪽을 앞서 띄우면 책 한 권의 임시 폴더를 쪽들이 동시에 쓴다 — 칼럼별 임시 이름이
+# 쪽 사이에 겹치면 A쪽 OCR이 B쪽 이미지를 읽는다('p1' 10단 = 'p11' 0단이던 이름).
+_names = []
+_real_start, _real_img = pdf_text._start_ocr, pdf_text._ocr_image
+pdf_text._start_ocr = lambda img, tmp_dir, name, dpi: (_names.append(name), ([], []))[1]
+pdf_text._ocr_image = lambda *_a, **_k: ([], True, "")
+try:
+    _img = Image.new("L", (400, 50), 255)
+    pdf_text.tesseract_lines(_img, [], Path("."), [(i * 30, i * 30 + 20) for i in range(11)],
+                             tag="p1")
+    pdf_text.tesseract_lines(_img, [], Path("."), [(0, 20)], tag="p11")
+    pdf_text.tesseract_lines(_img, [], Path("."), [(0, 20)], tag="p1r")
+finally:
+    pdf_text._start_ocr, pdf_text._ocr_image = _real_start, _real_img
+check("column temp names never collide across pages", len(_names) == 13 == len(set(_names)))
+
 print(f"\n{'ALL PASS' if not FAIL else f'{len(FAIL)}건 실패'} "
       f"(총 {TOTAL}건)")
 sys.exit(1 if FAIL else 0)
