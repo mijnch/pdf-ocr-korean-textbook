@@ -15,7 +15,7 @@
 | **온디바이스 가속** | 수식 인식 모델을 **KV캐시 + int8로 재제작**해 인식 4.16배 · 인코더를 내장 GPU(DirectML)로 옮겨 **전체 1.37배** |
 | **규모** | 실제 교재 **9권 7,530쪽** 재변환, 페이지 실패 0 |
 | **정확도** | 원본 쪽 대조 **문자 일치율 93.8% · 낱말 회수율 96.5%** (8권 16쪽 전사 대조) |
-| **검증** | 골든 테스트 300건 (모델 없이 실행, CI 298건 — 개인 장 구분 파일이 필요한 2건 제외) + 원본 쪽 정답지 채점 스크립트 |
+| **검증** | 골든 테스트 305건 (모델 없이 실행, CI 303건 — 개인 장 구분 파일이 필요한 2건 제외) + 원본 쪽 정답지 채점 스크립트 |
 | **설치** | `환경 설치.bat` 한 번 — 모델 252MB는 릴리스에서 자동으로 받는다 |
 
 <details>
@@ -47,8 +47,8 @@ Guiding rule: **a wrong table or page number is worse than none.** Tables whose 
 trusted are kept only as PNG; page numbers that cannot be confirmed are dropped.
 
 Measured on 9 real textbooks (7,530 pages): 0 page failures, 93.8% character accuracy and 96.5%
-word recall against hand-transcribed pages (8 books, 16 pages). 300 golden tests run without models
-(298 in CI; the other 2 need a private chapter profile). Windows-first; Korean UI.
+word recall against hand-transcribed pages (8 books, 16 pages). 305 golden tests run without models
+(303 in CI; the other 2 need a private chapter profile). Windows-first; Korean UI.
 
 Built with an AI coding assistant (Claude Code), as the `Co-Authored-By` trailers show. Problem
 definition, measurement on real textbooks, and the decision to adopt each design are mine.
@@ -130,11 +130,12 @@ flowchart TD
 ```
 
 산출물은 `## 400페이지 (인쇄 392쪽)` 절로 원본 쪽과 1:1 대응합니다.
-쪽들은 겹쳐 흐릅니다 — 다음 쪽의 렌더링·레이아웃 분석·Tesseract가 이번 쪽의
-수식 인식과 동시에 돕니다. 순서만 겹칠 뿐 쪽마다 같은 입력으로 같은 인식을 합니다
-(순차 처리와 쪽별 인식 입력·출력 지문이 같음을 대조했습니다). 몇 쪽을 앞서 띄울지와
-Tesseract 동시 작업 수는 `설정.toml`의 `[speed]`에서 바꿀 수 있습니다 — 값을 바꿔도
-산출물은 바이트 단위로 같습니다.
+쪽들은 겹쳐 흐릅니다 — 뒤쪽의 렌더링·레이아웃 분석·Tesseract가 이번 쪽의 수식 인식과
+동시에 돕니다. 처리가 Tesseract를 기다리는 책(고해상 스캔본)이면 최대 세 쪽까지 앞서
+띄우고, 기다림이 없는 책은 다음 쪽 하나만 띄웁니다. 순서만 겹칠 뿐 쪽마다 같은 입력으로
+같은 인식을 합니다(순차 처리와 쪽별 인식 입력·출력 지문이 같음을 대조했습니다). 몇 쪽까지
+앞서 띄울지와 Tesseract 동시 작업 수는 `설정.toml`의 `[speed]`에서 바꿀 수 있습니다 —
+값을 바꿔도 산출물은 바이트 단위로 같습니다.
 
 변환이 중간에 끊기면(전원·Ctrl+C) 같은 PDF를 다시 실행할 때 **끊긴 쪽부터 이어 씁니다.**
 마지막 쪽 절은 덜 쓰였을 수 있어 그 쪽부터 다시 읽고, 책 단위 확정은 이어 쓴 뒤
@@ -150,7 +151,7 @@ GPU 서버나 클라우드 API 없이 **노트북의 CPU와 내장 GPU만으로*
 | 수식 인식 인코더 | 내장 GPU (DirectML) | **인코더 1.57배 · 수식 인식 1.51배 · 전체 1.37배.** iGPU가 다음 배치를 인코딩하는 동안 CPU가 현재 배치를 디코딩한다. 배치 구성이 순차 경로와 같아 출력도 같다 (305크롭 305/305 일치) |
 | 수식 인식 디코더 | CPU (int8) | int8 연산자를 DirectML이 지원하지 않는다 |
 | 수식 검출 | CPU | iGPU로 옮기면 전송 오버헤드가 이득을 상쇄한다 |
-| 쪽 사이 | CPU 스레드 겹침 | 다음 쪽의 렌더링·레이아웃 분석·Tesseract가 이번 쪽의 수식 인식과 동시에 돈다 (4권 × 20쪽: 쪽당 시간 −15% · −15% · −16% · −27%). 더 깊게(2·3쪽 앞서) 겹쳐도 6코어에서는 −1~+3%뿐이고(스캔본 2권 16쪽, 교차 3회 — Tesseract 가 쉬는 틈이 메워지는 만큼 같은 CPU를 쓰는 레이아웃 분석이 느려진다), Tesseract 동시 작업을 4에서 6·8로 늘리면 레이아웃 분석이 2배 넘게 느려져 오히려 손해다 |
+| 쪽 사이 | CPU 스레드 겹침 | 뒤쪽의 렌더링·레이아웃 분석·Tesseract가 이번 쪽의 수식 인식과 동시에 돈다 (다음 쪽 하나만 겹칠 때 4권 × 20쪽: 쪽당 시간 −15% · −15% · −16% · −27%). Tesseract를 기다리는 동안에만 뒤쪽 셋까지 앞서 띄우면 400dpi 스캔본이 다시 **1.04~1.07배**, 300dpi 스캔본·내장층 책은 그대로다 (6권 16쪽, 교차 측정). 늘 셋을 띄우면 기다림이 없는 책이 0.94~0.96배로 느려져 기다림을 보고 정한다. 레이아웃 분석(torch)의 OpenMP 스핀 대기도 꺼야 한다 — 켜 둔 채로는 기다리며 도는 스레드가 CPU를 붙잡아 레이아웃이 2.5배 느려지고 이득이 0~3%로 사라졌다. Tesseract 동시 작업을 4에서 6·8로 늘리는 것은 같은 이유로 손해다 |
 
 ### 수식 인식 모델을 다시 만들었다 — KV캐시 + int8
 
@@ -373,7 +374,7 @@ DLL만 바뀌어, **`import` 버전과 `dist-info` 버전이 어긋난 혼성 �
 | **원본 쪽 대조** | **문자 일치율 93.8% · 낱말 회수율 96.5%** — 8권 16쪽 전사 대조, 재변환한 말뭉치 (이전 93.4% · 94.3%) |
 | 기계 교차 대조 | 산문 회수 95.6% · 정밀도 98.5% — 내장층 있는 책 504쪽 |
 | 인쇄 쪽번호 회수 | 90.5~97.2% · 중복 0 · 역행 0 (쪽번호가 인쇄되지 않은 판본 1권은 0이 정답) |
-| 골든 테스트 | 300건 (모델·외부 프로세스 없이 실행). CI는 main 브랜치 push와 PR마다 Windows·Python 3.14에서 돌리며, 개인 장 구분 파일이 필요한 2건은 건너뛴다(CI 298건) |
+| 골든 테스트 | 305건 (모델·외부 프로세스 없이 실행). CI는 main 브랜치 push와 PR마다 Windows·Python 3.14에서 돌리며, 개인 장 구분 파일이 필요한 2건은 건너뛴다(CI 303건) |
 | 저장소 크기 | 소스 380KB — 모델 252MB는 릴리스 자산 |
 
 가속: 수식 인식 모델을 KV캐시 + int8로 재제작하고(인식 4.16배), 인코더를 DirectML(iGPU)에
@@ -455,7 +456,7 @@ venv\Scripts\python scripts\정답지_채점.py --rerun  # 정답지 쪽을 현�
 | `scripts/setup_env.py` | 폴더 안 venv 구성 · 자산 내려받기 · 가속 검증 |
 | `scripts/common.py` | 외부 도구 경로 · 오프라인 가드 |
 | `scripts/mfr_rebuild/` | 수식 인식 모델 재제작 — ONNX 가중치 이식 → KV캐시 포함 재수출 → int8 양자화 |
-| `scripts/tests/test_pure.py` | 순수 함수 골든 테스트 300건 |
+| `scripts/tests/test_pure.py` | 순수 함수 골든 테스트 305건 |
 | `설정.toml` / `장구분.example.toml` | 임계값·장 구분 프로파일 (코드 수정 없이 조정) |
 
 ## 범위와 한계

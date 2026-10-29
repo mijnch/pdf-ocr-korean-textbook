@@ -229,13 +229,48 @@ class PagePool:
                 t.join()
 
 
-# 뒤쪽을 몇 개까지 앞서 띄울지 — 그 쪽들의 렌더링·레이아웃·수식 검출·Tesseract가 이번
-# 쪽의 수식 인식·마무리와 겹쳐 돈다. 1이 예전(바로 다음 쪽만) 동작이다. 출력은 같고
-# 시간과 메모리만 달라진다(설정.toml [speed] — 산출물을 바이트 단위로 대조했다). 6코어
-# 실측(스캔본 2권 16쪽, 교차 3회)에서 2·3쪽은 −1~+3%뿐이고 CPU 사용률만 73→86~91%로
-# 오른다 — Tesseract 가 쉬는 틈은 메워지지만 같은 CPU를 쓰는 레이아웃이 그만큼 느려진다.
-# 그래서 기본은 1이다. 코어가 많은 PC에서 늘려 볼 값.
+# 뒤쪽을 최대 몇 개까지 앞서 띄울지 — 그 쪽들의 렌더링·레이아웃·수식 검출·Tesseract가
+# 이번 쪽의 수식 인식·마무리와 겹쳐 돈다. 1이 예전(바로 다음 쪽만) 동작이다. 출력은 같고
+# 시간과 메모리만 달라진다(설정.toml [speed] — 산출물을 바이트 단위로 대조했다).
+# 늘 최대로 띄우지는 않는다(AheadControl) — 이득은 메인 스레드가 Tesseract 를 기다리는 책
+# 에서만 난다. 6코어 실측(16쪽, 교차 3회, 늘 3쪽): Neaman 1.07배·Razavi 1.03배(400dpi
+# 스캔, 쪽마다 2~3초 기다림)인데 Sadiku 0.94배(300dpi, 0.5초)·Floyd 0.96배(내장층, 0초) —
+# 기다림이 없으면 앞선 쪽의 레이아웃·수식 검출이 이번 쪽의 수식 인식과 CPU를 다툴 뿐이다.
 PAGES_AHEAD = tuning.get("speed", "pages_ahead")
+# 레이아웃(torch)이 쓰는 Intel OpenMP 는 병렬 구간이 끝난 뒤 200ms 동안 스레드를 돌려 다음
+# 일을 기다린다(KMP_BLOCKTIME 기본값). 뒤쪽을 앞서 띄우면 그 사이 Tesseract 가 여럿 돌아,
+# 기다리며 도는 스레드가 CPU를 붙잡고 레이아웃은 2.5배 느려져 이득이 0~3%로 사라졌다(6코어
+# 실측, 레이아웃 26→65초). 0이면 기다리는 스레드가 바로 잠들어 CPU를 넘긴다 — 계산 순서는
+# 같아 산출물은 바이트 단위로 같다. 다투지 않는 내장층 책 하나(Floyd)는 2.5% 느려지지만
+# 400dpi 스캔본이 4~7% 빨라진다. 앞서 띄우지 않으면(1) 예전대로 둔다. onnxruntime(수식
+# 검출·인식)의 스핀은 끄지 않는다 — 껐더니 작은 연산이 이어지는 디코더가 오히려 느려졌다.
+# torch 는 모델을 올릴 때 처음 import 되므로 여기(모듈 import 때)면 OpenMP 런타임보다 이르다.
+if PAGES_AHEAD > 1:
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+AHEAD_UP_WAIT = 1.0      # 쪽마다 Tesseract 를 이만큼(초, 이동 평균) 넘게 기다리면 한 쪽 더 띄운다
+AHEAD_DOWN_WAIT = 0.25   # 이보다 덜 기다리면 한 쪽 덜 띄운다. 사이는 그대로(깊이가 바뀌면
+                         # 기다림도 바뀌므로 문턱을 벌려 둔다 — 실측 기다림 3.4·2.1 vs 0.5·0초)
+
+
+class AheadControl:
+    """앞서 띄울 쪽 수를 메인 스레드가 Tesseract 를 기다린 시간의 이동 평균으로 정한다.
+
+    1쪽에서 시작해 기다림이 AHEAD_UP_WAIT 를 넘으면 한 쪽씩 늘리고(최대 limit),
+    AHEAD_DOWN_WAIT 밑으로 내려가면 한 쪽씩 줄인다. 내장 텍스트층 쪽은 기다림 0으로 센다.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = max(1, limit)
+        self.depth = 1
+        self.avg = 0.0
+
+    def update(self, waited: float) -> int:
+        self.avg = 0.75 * self.avg + 0.25 * waited     # 최근 몇 쪽에 무게를 두는 지수 평균
+        if self.avg > AHEAD_UP_WAIT and self.depth < self.limit:
+            self.depth += 1
+        elif self.avg < AHEAD_DOWN_WAIT and self.depth > 1:
+            self.depth -= 1
+        return self.depth
 # Tesseract를 MFR과 겹쳐 돌리는 전용 스레드 풀. 고해상 페이지의 두 Tesseract
 # 패스(400dpi 주 + 200dpi 보충)는 서로 의존이 없어 함께 돈다 — 실측 A/B(공학수학1
 # 5쪽): 워커 1→2에서 10.66→8.95초/쪽, 정확도 손실 0. 여기에 다음 쪽의 두 패스가
@@ -658,7 +693,10 @@ def process_page(page, inp: dict, images_dir: Path, page_no: int,
         weave: list[dict] = []  # 내장 경로는 줄에 인라인 수식이 이미 들어 있음
         source = "내장 텍스트"
     else:
+        t_wait = time.perf_counter()
         lines = started["main"].result()
+        # 수식 인식을 마치고 Tesseract 를 기다린 시간 — 앞서 띄울 쪽 수를 정하는 신호(AheadControl)
+        started["waited"] = time.perf_counter() - t_wait
         k_ocr, alt_main = started["k"], started["alt_main"]
         if k_ocr != 1.0:  # 고해상 좌표 → 기준 공간으로 환산
             for ln in lines + [l for r in alt_main for l in r]:
@@ -1101,14 +1139,15 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                         force_scan = True
                         print("         낮아서 스캔 경로로 전환합니다"
                               " — 출판사 선행 OCR이 망가진 책입니다.")
-            # 선행 파이프라인: 뒤쪽 PAGES_AHEAD개의 입력은 메인 스레드가 미리
-            # 마련하고(pdfium 제약), 선행 스레드가 그 쪽들의 레이아웃·수식 검출을
-            # 차례로 한 뒤 Tesseract까지 띄운다 — 스캔본은 뒤쪽들의 인식이 이번
-            # 쪽의 수식 인식·마무리와 겹쳐 돈다. 첫 쪽·선계산이 실패한 쪽의 계산도
+            # 선행 파이프라인: 뒤쪽 몇 개(ahead_ctl.depth, 최대 PAGES_AHEAD)의 입력은
+            # 메인 스레드가 미리 마련하고(pdfium 제약), 선행 스레드가 그 쪽들의 레이아웃·
+            # 수식 검출을 차례로 한 뒤 Tesseract까지 띄운다 — 스캔본은 뒤쪽들의 인식이
+            # 이번 쪽의 수식 인식·마무리와 겹쳐 돈다. 첫 쪽·선계산이 실패한 쪽의 계산도
             # 같은 선행 스레드에 맡긴다 — 같은 모델 싱글턴을 두 스레드가 동시에
             # 돌리는 경합을 막는다(검토단 지적). 쪽 번호 순으로 꺼내므로 이번 쪽의
             # 재계산이 미리 맡긴 뒤쪽들보다 먼저 돈다.
             next_ahead = start_page             # 아직 미리 띄우지 않은 첫 쪽
+            ahead_ctl = AheadControl(PAGES_AHEAD)
 
             def fill_ahead(last: int) -> None:
                 nonlocal next_ahead
@@ -1131,7 +1170,7 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 try:
                     while ahead and ahead[0][0] < page_no:  # 앞 쪽이 도중에 실패한 잔여분
                         ahead.popleft()[2].cancel()
-                    fill_ahead(page_no + PAGES_AHEAD)
+                    fill_ahead(page_no + ahead_ctl.depth)
                     mine = ahead.popleft() if ahead and ahead[0][0] == page_no else None
                     page = pdf[page_no - 1]
                     inp = mine[1] if mine else prepare_page(page, force_scan)
@@ -1146,6 +1185,9 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                             page_no, precompute_page, inp, tmp_dir, page_no).result()
                     page_md, n_formulas, source, printed = process_page(
                         page, inp, images_dir, page_no, tmp_dir, pre=pre)
+                    # 첫 쪽은 겹칠 앞 쪽이 없어 늘 기다리므로 세지 않는다. 내장층 쪽은 0초다.
+                    if page_no > start_page:
+                        ahead_ctl.update((pre[2] or {}).get("waited", 0.0))
                     # 조용한 전멸 방어: 잉크는 있는데 본문이 한 글자도 안 나온
                     # 쪽은 눕힌 스캔일 수 있다(레이아웃이 본문을 그림으로 오분류).
                     # OSD로 세워 한 번만 다시 인식한다.
@@ -1179,7 +1221,8 @@ def process_pdf(pdf_path: Path, output_dir: Path) -> Path:
                 out.flush()  # 중단 시에도 여기까지의 결과가 파일에 남는다
                 print(
                     f"    {page_no}/{num_pages}페이지 완료"
-                    f" (본문: {source}, 수식 {n_formulas}개)"
+                    f" (본문: {source}, 수식 {n_formulas}개"
+                    + (f", 앞서 {ahead_ctl.depth}쪽" if ahead_ctl.depth > 1 else "") + ")"
                 )
             # 완료 표식 — 이 줄이 없으면 중단으로 잘린 파일이다(재실행 판단 근거).
             # 수식 수는 아래 확정 단계에서 파일 실측값으로 바뀐다(recount_marker).

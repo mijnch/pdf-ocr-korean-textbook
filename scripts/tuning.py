@@ -64,7 +64,7 @@ DEFAULTS: dict[str, dict[str, tuple]] = {
         "scan_cell_min_conf": (80, [0, 100]),    # 스캔 셀 합의 신뢰도
     },
     "speed": {                 # 속도 — 결과는 그대로이고 시간·메모리만 달라진다
-        "pages_ahead": (1, [1, 8]),              # 미리 띄울 뒤쪽 수(6코어 실측 2·3쪽 −1~+3%)
+        "pages_ahead": (3, [1, 8]),              # 최대 선행 쪽 수(Tesseract 를 기다릴 때만 늘림, 1 = 예전)
         "tess_workers": (4, [1, 32]),            # Tesseract 동시 작업(작업 = 프로세스 2개, 6·8은 느림)
     },
 }

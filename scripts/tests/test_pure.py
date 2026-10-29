@@ -897,6 +897,10 @@ check("scan cell pipe left for pdf_table to escape once", _cell == "a|b" and _ce
 
 # 병렬로 띄운 Tesseract끼리 OpenMP 스레드를 다투지 않게 한다(Linux 실측: 쪽마다 시간 초과)
 check("tesseract OpenMP limited", pdf_text._tess_env().get("OMP_THREAD_LIMIT") == "1")
+# 앞서 띄울 때는 레이아웃(torch)의 OpenMP 스레드가 기다리며 돌아 Tesseract 와 CPU를 다투지
+# 않게 한다(6코어 실측). pages_ahead 1이면 예전대로 둔다.
+check("torch OpenMP spin-wait off while looking ahead",
+      (common.os.environ.get("KMP_BLOCKTIME") == "0") == (pdf_ocr.PAGES_AHEAD > 1))
 
 # ─── 쪽 간 선행: 앞 쪽 작업부터 꺼내고, 쪽마다 임시 파일 이름이 다르다 ───
 import threading  # noqa: E402
@@ -945,6 +949,19 @@ _queued = [_pool.submit_for(p, _ran.append, f"q{p}") for p in (1, 2)]
 _pool.shutdown(wait=False, cancel_futures=True)   # Ctrl+C 경로
 _gate3.set()
 check("page pool shutdown cancels queued jobs", all(f.cancelled() for f in _queued))
+
+# 앞서 띄울 쪽 수는 메인 스레드가 Tesseract 를 기다린 만큼만 늘린다(400dpi 스캔본 2~3초/쪽 →
+# 최대까지, 300dpi·내장층 책 0~0.5초/쪽 → 다음 쪽 하나만 — 늘 띄우면 그 책들이 느려졌다)
+_ac = pdf_ocr.AheadControl(3)
+_tr = [_ac.update(3.4) for _ in range(8)]
+check("lookahead grows while the main thread waits for Tesseract", _tr[0] == 1 and _tr[-1] == 3)
+_tr = [_ac.update(0.0) for _ in range(12)]
+check("lookahead shrinks back when waiting stops", _tr[-1] == 1)
+_ac = pdf_ocr.AheadControl(3)
+check("lookahead stays at one page for books that barely wait",
+      all(_ac.update(0.5) == 1 for _ in range(30)))
+_ac = pdf_ocr.AheadControl(1)
+check("pages_ahead 1 keeps the old one-page lookahead", all(_ac.update(9.0) == 1 for _ in range(5)))
 
 # 여러 쪽을 앞서 띄우면 책 한 권의 임시 폴더를 쪽들이 동시에 쓴다 — 칼럼별 임시 이름이
 # 쪽 사이에 겹치면 A쪽 OCR이 B쪽 이미지를 읽는다('p1' 10단 = 'p11' 0단이던 이름).
