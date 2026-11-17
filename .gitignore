@@ -1,0 +1,37 @@
+# 재다운로드 가능한 것 — 저장소에 넣지 않는다
+# (tessdata·models 는 릴리스 자산으로 배포한다. scripts/setup_env.py 가 받아온다)
+scripts/tessdata/
+scripts/models/
+# scripts/mfr_rebuild/ 로 모델을 다시 만들 때 생기는 산출물 (100MB 넘는 파일 — GitHub 가 거부한다)
+scripts/mfr_rebuild/mfr_pt/
+scripts/mfr_rebuild/mfr_kv_onnx/
+
+# 폴더 안 파이썬 환경 (1.4GB). setup_env.py 가 대상 PC에서 새로 만든다.
+venv/
+_assets.zip
+
+# 변환 중 쓰는 작업 폴더 (도구 폴더 안에 두어 %TEMP% 를 더럽히지 않는다)
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+
+# 입력/출력 폴더 (작업물은 Documents 쪽이 원본)
+PDF OCR/*입력*/
+PDF OCR/*출력*/
+*.pdf
+*.png
+*.jpg
+
+# 백업 사본
+*.bak
+*.bak_*
+*_백업/
+
+# 실제 사용 프로파일·개인 설명서는 공개하지 않는다 (예시는 장구분.example.toml)
+장구분.toml
+사용 설명서.txt
+
+# 정답지(원본 쪽 전사)는 교재 내용이다 — scripts\정답지_채점.py 가 로컬에서만 쓴다
+정답지/
+재산출전_백업_*/

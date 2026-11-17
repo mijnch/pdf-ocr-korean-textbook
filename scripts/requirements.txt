@@ -1,0 +1,31 @@
+# PDF Editor 가 실제로 import 하는 것만 담았다 (2026-08-13 정리, dry-run 검증).
+# 환경 전체를 얼린 잠금 파일은 두지 않는다 — 예전 스냅숏은 무관한 패키지끼리
+# 버전이 충돌해 그것으로는 환경을 다시 만들 수 없었다(ResolutionImpossible 실측).
+#
+# ★★ onnxruntime 은 반드시 -directml 판이어야 한다
+#   일반 onnxruntime 이 같이 깔리면 같은 onnxruntime/ 폴더를 덮어써 iGPU 가속이
+#   죽는다(과거 실제 사고). dry-run 으로 확인한 유입 경로는
+#       optimum → optimum-onnx → onnxruntime
+#   이라 optimum 을 여기서 뺐다. setup_env.py 가 설치 후 DirectML 을 검증한다.
+#
+# ★ mfr_rebuild/ (MFR 모델 재제작 일회성 유틸) 는 onnx·optimum 이 더 필요하다.
+#   그 작업을 할 때만 따로 깔 것 — 평상시 변환에는 쓰이지 않는다:
+#       venv\Scripts\python -m pip install onnx optimum
+#   (그러면 일반 onnxruntime 이 들어와 가속이 꺼질 수 있으니, 끝난 뒤
+#    python -m pip install --force-reinstall onnxruntime-directml 로 되돌릴 것.)
+#
+# ★ rapidocr 는 직접 import 하지 않지만 판을 묶는다 (2026-10-23)
+#   pix2text → cnstd 1.2.8 이 rapidocr.utils.model_resolver.resolve_model_key 를
+#   불러오는데, rapidocr 3.10.0(2026-10-08)에서 그 함수가 route_to_model_key 로
+#   바뀌어 import pix2text 가 ImportError 로 죽는다(새 클론 설치에서 실측).
+#   cnstd 는 rapidocr>=3.9.1 만 요구해서 묶지 않으면 최신판이 깔린다.
+#   cnstd 가 새 이름을 따라가면 이 줄을 풀 것.
+
+pillow==12.2.0
+numpy==2.5.0
+pypdfium2==5.9.0
+pix2text==1.1.6
+rapidocr==3.9.2
+transformers==4.57.6
+torch==2.12.0
+onnxruntime-directml==1.24.4
